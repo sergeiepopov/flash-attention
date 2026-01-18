@@ -22,6 +22,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "cuda_check.h"
+#include "flash_math_constants.h"
 
 namespace flash {
 

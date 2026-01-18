@@ -137,14 +137,8 @@
 #else
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
-    if (ARCH == 86 || ARCH == 89) {                                                              \
-      constexpr static int ARCH_NAME = 86;                                                       \
-      return __VA_ARGS__();                                                                      \
-    } else if (ARCH < 90) {                                                                      \
+    {                                                                                            \
       constexpr static int ARCH_NAME = 80;                                                       \
-      return __VA_ARGS__();                                                                      \
-    } else {                                                                                     \
-      constexpr static int ARCH_NAME = 90;                                                       \
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
