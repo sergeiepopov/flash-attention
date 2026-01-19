@@ -92,7 +92,7 @@ endif()
 
 find_package(Torch REQUIRED)
 
-add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim128_fp16_packgqa_sm90.cu)
+add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim128_fp16_sm80.cu)
 
 #file(GLOB CU_SOURCES CONFIGURE_DEPENDS
 #  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_attn/src/*.cu"
