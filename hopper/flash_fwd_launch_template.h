@@ -192,8 +192,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
-        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
+        cutlass::Status cutlassStatus = cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
                                            Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/);
+        if (cutlassStatus != cutlass::Status::kSuccess) {
+            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cutlass::cutlassGetStatusString(cutlassStatus));
+        }
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }

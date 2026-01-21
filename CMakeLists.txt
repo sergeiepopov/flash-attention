@@ -92,7 +92,7 @@ endif()
 
 find_package(Torch REQUIRED)
 
-add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim128_fp16_sm80.cu)
+add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim128_fp16_sm80.cu hopper/flash_fwd_launch_template.h)
 
 #file(GLOB CU_SOURCES CONFIGURE_DEPENDS
 #  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_attn/src/*.cu"
@@ -200,7 +200,7 @@ endif()
 
 # Set this to your GPU(s). Examples: 75 (Turing), 80 (A100), 86 (Ampere), 89 (Ada), 90 (Hopper)
 set_target_properties(flash-attention PROPERTIES
-  CUDA_ARCHITECTURES 80
+  CUDA_ARCHITECTURES 120
 )
 
 # Copy PyTorch DLLs to output directory on Windows
@@ -250,6 +250,10 @@ if(WIN32)
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:/U_DEBUG>
     $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-Xcompiler=/U_DEBUG>
+    #$<$<COMPILE_LANGUAGE:CUDA>:-g>           # Generate debug info
+    #$<$<COMPILE_LANGUAGE:CUDA>:-G>           # Generate device debug info
+    #$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>    # Generate line info
+    #$<$<COMPILE_LANGUAGE:CUDA>:-O0>          # Disable optimizations for debug
   )
   # Force linker to ignore debug Python library and use release version
   target_link_options(flash-attention PRIVATE
