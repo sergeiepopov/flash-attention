@@ -428,6 +428,7 @@ struct CollectiveMainloopFwdSm80 {
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
+        printf("debug: %d %d %d %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, (int)PagedKV, (int)Share_QV_Smem, kStages, (int)AppendKV, Q_in_regs);
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
             if constexpr (!PagedKV) {

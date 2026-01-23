@@ -200,7 +200,7 @@ endif()
 
 # Set this to your GPU(s). Examples: 75 (Turing), 80 (A100), 86 (Ampere), 89 (Ada), 90 (Hopper)
 set_target_properties(flash-attention PROPERTIES
-  CUDA_ARCHITECTURES 120
+  CUDA_ARCHITECTURES 80
 )
 
 # Copy PyTorch DLLs to output directory on Windows

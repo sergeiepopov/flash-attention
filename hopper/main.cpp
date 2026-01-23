@@ -1883,7 +1883,7 @@ int main(int argc, char ** argv) {
             std::nullopt,  // k_descale
             std::nullopt,  // v_descale
             std::nullopt,  // softmax_scale (will use default 1/sqrt(head_dim))
-            false,         // is_causal
+            true,          // is_causal
             -1,            // window_size_left
             -1,            // window_size_right
             0,             // attention_chunk
@@ -1913,8 +1913,115 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        std::cout << "\n=== TEST PASSED ===" << std::endl;
+        std::cout << "\n=== BASIC CHECKS PASSED ===" << std::endl;
         std::cout << "Flash attention forward pass executed successfully!" << std::endl;
+
+        // CPU-side validation
+        std::cout << "\n--- CPU Validation (Causal Attention) ---" << std::endl;
+        std::cout << "Computing reference causal attention on CPU with float16 precision..." << std::endl;
+
+        // Move tensors to CPU keeping float16 precision
+        auto q_cpu = q.cpu();
+        auto k_cpu = k.cpu();
+        auto v_cpu = v.cpu();
+
+        // Compute reference attention: softmax(Q @ K^T / sqrt(d)) @ V
+        // Q: [batch, seqlen_q, num_heads, head_dim]
+        // K: [batch, seqlen_k, num_heads, head_dim]
+        // V: [batch, seqlen_k, num_heads, head_dim]
+        
+        // Transpose to [batch, num_heads, seqlen, head_dim] for easier computation
+        auto q_ref = q_cpu.transpose(1, 2);  // [batch, num_heads, seqlen_q, head_dim]
+        auto k_ref = k_cpu.transpose(1, 2);  // [batch, num_heads, seqlen_k, head_dim]
+        auto v_ref = v_cpu.transpose(1, 2);  // [batch, num_heads, seqlen_k, head_dim]
+
+        // Compute Q @ K^T (in float16)
+        auto scores = torch::matmul(q_ref, k_ref.transpose(-2, -1));  // [batch, num_heads, seqlen_q, seqlen_k]
+        
+        // Scale by 1/sqrt(head_dim)
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        scores = scores * scale;
+
+        // Apply causal mask: mask out future positions (query_pos < key_pos)
+        // Create causal mask: upper triangular matrix with -inf
+        auto causal_mask = torch::triu(
+            torch::full({seqlen_q, seqlen_k}, -std::numeric_limits<float>::infinity(), 
+                       torch::TensorOptions().dtype(torch::kFloat32)),
+            /*diagonal=*/1  // Start masking from diagonal+1 (future positions)
+        );
+        // Convert scores to float32, apply mask, then convert back to float16
+        scores = scores.to(torch::kFloat32) + causal_mask;
+        scores = scores.to(torch::kFloat16);
+
+        // Apply softmax (internally uses float32 accumulation but returns float16)
+        auto attn_weights = torch::softmax(scores, /*dim=*/-1);  // [batch, num_heads, seqlen_q, seqlen_k]
+
+        // Compute attention output: attn_weights @ V (in float16)
+        auto out_ref = torch::matmul(attn_weights, v_ref);  // [batch, num_heads, seqlen_q, head_dim]
+        
+        // Transpose back to [batch, seqlen_q, num_heads, head_dim]
+        out_ref = out_ref.transpose(1, 2);
+
+        // Flash attention output already on CPU
+        auto out_flash_cpu = out_cpu;
+
+        // Convert both to float32 for error computation (to avoid float16 precision issues in error calculation)
+        auto out_ref_f32 = out_ref.to(torch::kFloat32);
+        auto out_flash_f32 = out_flash_cpu.to(torch::kFloat32);
+
+        // Compute relative error
+        auto diff = (out_ref_f32 - out_flash_f32).abs();
+        auto rel_error = diff / (out_ref_f32.abs() + 1e-5f);
+        
+        float max_abs_error = diff.max().item<float>();
+        float mean_abs_error = diff.mean().item<float>();
+        float max_rel_error = rel_error.max().item<float>();
+        float mean_rel_error = rel_error.mean().item<float>();
+
+        std::cout << "Error statistics:" << std::endl;
+        std::cout << "  Max absolute error:  " << max_abs_error << std::endl;
+        std::cout << "  Mean absolute error: " << mean_abs_error << std::endl;
+        std::cout << "  Max relative error:  " << max_rel_error << std::endl;
+        std::cout << "  Mean relative error: " << mean_rel_error << std::endl;
+
+        // Additional diagnostics for high relative error
+        if (max_rel_error > 1.0f) {
+            std::cout << "\nWARNING: High relative error detected!" << std::endl;
+            
+            // Find where the max relative error occurs
+            auto max_rel_idx = rel_error.argmax();
+            float ref_val = out_ref_f32.flatten()[max_rel_idx].item<float>();
+            float flash_val = out_flash_f32.flatten()[max_rel_idx].item<float>();
+            float abs_diff = std::abs(ref_val - flash_val);
+            
+            std::cout << "  Location of max relative error:" << std::endl;
+            std::cout << "    Reference value: " << ref_val << std::endl;
+            std::cout << "    Flash value:     " << flash_val << std::endl;
+            std::cout << "    Absolute diff:   " << abs_diff << std::endl;
+            
+            if (std::abs(ref_val) < 0.01f) {
+                std::cout << "  Note: Reference value is near zero - relative error is inflated" << std::endl;
+            }
+        }
+
+        // Check if errors are within acceptable tolerance
+        // FP16 typically has ~3 decimal digits of precision
+        // With accumulated operations, we allow larger tolerance
+        const float abs_tol = 1e-2f;  // 0.01 for FP16
+        const float rel_tol = 5e-2f;  // 5% relative error
+        
+        bool validation_passed = (max_abs_error < abs_tol || max_rel_error < rel_tol);
+        
+        if (validation_passed) {
+            std::cout << "\n=== VALIDATION PASSED ===" << std::endl;
+            std::cout << "Flash-Attention output matches reference implementation!" << std::endl;
+        } else {
+            std::cerr << "\n=== VALIDATION FAILED ===" << std::endl;
+            std::cerr << "Flash-Attention output does not match reference!" << std::endl;
+            std::cerr << "Max error exceeds tolerance (abs_tol=" << abs_tol 
+                      << ", rel_tol=" << rel_tol << ")" << std::endl;
+            return 1;
+        }
 
     } catch (const std::exception & e) {
         std::cerr << "\nERROR: " << e.what() << std::endl;
