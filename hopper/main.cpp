@@ -381,7 +381,7 @@ void run_mha_fwd(Flash_fwd_params & params, cudaStream_t stream) {
             PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
                 PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
                     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation
-                    static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    static constexpr bool PackGQA = /*PackGQA_ || Arch < 90 || PagedKVNonTMA || Split*/false;
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(params, stream);
                     });
@@ -438,7 +438,7 @@ inline bool get_pagedkv_tma(Flash_fwd_params const & params) {
 inline bool get_pack_gqa(Flash_fwd_params const & params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
-    if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
+    //if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
 #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
 #else
