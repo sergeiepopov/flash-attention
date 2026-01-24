@@ -1843,7 +1843,7 @@ int main(int argc, char ** argv) {
         const int seqlen_q = 16;
         const int seqlen_k = 16;
         const int num_heads = 4;
-        const int head_dim = 128;
+        const int head_dim = 64;
 
         std::cout << "Creating tensors: [" << batch_size << ", " << seqlen_q
             << ", " << num_heads << ", " << head_dim << "]" << std::endl;

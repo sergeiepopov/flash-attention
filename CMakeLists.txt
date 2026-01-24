@@ -23,9 +23,10 @@ option(FLASHATTENTION_DISABLE_FP16 "Disable FP16 support" OFF)
 option(FLASHATTENTION_DISABLE_FP8 "Disable FP8 (E4M3) support" ON)
 option(FLASHATTENTION_DISABLE_VARLEN "Disable variable length sequences" ON)
 option(FLASHATTENTION_DISABLE_CLUSTER "Disable cluster support" ON)
-option(FLASHATTENTION_DISABLE_HDIM64 "Disable head dimension 64" ON)
+option(FLASHATTENTION_DISABLE_HDIMDIFF64 "" ON)
+option(FLASHATTENTION_DISABLE_HDIM64 "Disable head dimension 64" OFF)
 option(FLASHATTENTION_DISABLE_HDIM96 "Disable head dimension 96" ON)
-option(FLASHATTENTION_DISABLE_HDIM128 "Disable head dimension 128" OFF)
+option(FLASHATTENTION_DISABLE_HDIM128 "Disable head dimension 128" ON)
 option(FLASHATTENTION_DISABLE_HDIM192 "Disable head dimension 192" ON)
 option(FLASHATTENTION_DISABLE_HDIM256 "Disable head dimension 256" ON)
 
@@ -92,7 +93,7 @@ endif()
 
 find_package(Torch REQUIRED)
 
-add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim128_fp16_sm80.cu hopper/flash_fwd_launch_template.h)
+add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim64_fp16_sm80.cu hopper/flash_fwd_launch_template.h)
 
 #file(GLOB CU_SOURCES CONFIGURE_DEPENDS
 #  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_attn/src/*.cu"
@@ -171,6 +172,11 @@ endif()
 if(FLASHATTENTION_DISABLE_CLUSTER)
   target_compile_definitions(flash-attention PRIVATE FLASHATTENTION_DISABLE_CLUSTER)
   message(STATUS "FlashAttention: Cluster disabled")
+endif()
+
+if(FLASHATTENTION_DISABLE_HDIMDIFF64)
+  target_compile_definitions(flash-attention PRIVATE FLASHATTENTION_DISABLE_HDIMDIFF64)
+  message(STATUS "FLASHATTENTION_DISABLE_HDIMDIFF64")
 endif()
 
 if(FLASHATTENTION_DISABLE_HDIM64)
