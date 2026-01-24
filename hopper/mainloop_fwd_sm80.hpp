@@ -437,7 +437,8 @@ struct CollectiveMainloopFwdSm80 {
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
-        printf("debug: %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, kStages, (int)Is_local);
+        printf("debug: %d %d %d %d %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, kStages, kBlockM, kBlockN, kHeadDim, n_block_min, n_block_max);
+
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
             //if constexpr (!PagedKV) {
@@ -629,7 +630,7 @@ struct CollectiveMainloopFwdSm80 {
             mask_fn(tSrS, n_block);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-            if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+            //if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
