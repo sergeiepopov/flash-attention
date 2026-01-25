@@ -48,7 +48,7 @@ struct CollectiveMainloopFwdSm80 {
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
-    static constexpr bool Has_cp_async = ArchTag::kMinComputeCapability >= 80;
+    static constexpr bool Has_cp_async = /*ArchTag::kMinComputeCapability >= 80*/false;
 
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -343,6 +343,12 @@ struct CollectiveMainloopFwdSm80 {
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
         Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
 
+        Layout s8 = make_layout(Int<8>{});
+        Layout s2xs4 = make_layout(make_shape(Int<2>{}, Int<4>{}));
+		if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
+        print2D(s2xs4);
+        //print2D(s8);
+
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
 
@@ -437,7 +443,7 @@ struct CollectiveMainloopFwdSm80 {
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
-        printf("debug: %d %d %d %d %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, kStages, kBlockM, kBlockN, kHeadDim, n_block_min, n_block_max);
+        //printf("debug: %d %d %d %d %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, kStages, kBlockM, kBlockN, kHeadDim, n_block_min, n_block_max);
 
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;

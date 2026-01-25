@@ -24,6 +24,19 @@
 #include "cuda_check.h"
 #include "flash_math_constants.h"
 
+template <class Shape, class Stride>
+CUTLASS_DEVICE
+void print2D(cute::Layout<Shape, Stride> const & layout)
+{
+    printf("print2D\n");
+    for (int m = 0; m < cute::size<0>(layout); ++m) {
+        for (int n = 0; n < cute::size<1>(layout); ++n) {
+            printf("%3d  ", layout(m, n));
+        }
+        printf("\n");
+    }
+}
+
 namespace flash {
 
 using namespace cute;
