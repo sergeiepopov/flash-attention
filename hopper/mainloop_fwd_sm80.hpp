@@ -345,8 +345,10 @@ struct CollectiveMainloopFwdSm80 {
 
         Layout s8 = make_layout(Int<8>{});
         Layout s2xs4 = make_layout(make_shape(Int<2>{}, Int<4>{}));
-		if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
-        print2D(s2xs4);
+        if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
+        {
+            //print2D(s2xs4);
+        }
         //print2D(s8);
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
@@ -359,6 +361,8 @@ struct CollectiveMainloopFwdSm80 {
         Tensor gK = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+
+        //printf("%d %d %d %d\n", get<0>(params.shape_Q_packed), get<1>(params.shape_Q_packed), get<2>(params.shape_Q_packed), get<3>(params.shape_Q_packed));
 
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
         auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
@@ -423,9 +427,72 @@ struct CollectiveMainloopFwdSm80 {
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
             // (seqlen_q - m_block * kBlockM). This is because the entries of t0QcQ are known at compile time.
             // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
-            );
+            //flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
+            //    gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
+            //);
+
+            // ============================================================================
+            // MANUAL REWRITE - What it does under the hood:
+            // ============================================================================
+
+            // Step 1: Calculate the M dimension limit (how many valid rows in this tile)
+            int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}));
+
+            // Step 2: Get tensor dimensions
+            // tQgQ and tQsQ have shape (VCOPY, MMA_M, MMA_K)
+            // - VCOPY: Number of vectorized copies per thread (e.g., 2)
+            // - MMA_M: Number of M elements this thread handles (e.g., 4)
+            // - MMA_K: Number of K elements this thread handles (e.g., 8)
+
+            int const num_vec_copies = size<0>(tQgQ);  // e.g., 2
+            int const num_m_elements = size<1>(tQgQ);  // e.g., 4  
+            int const num_k_elements = size<2>(tQgQ);  // e.g., 8
+
+            // Step 3: Triple nested loop with bounds checking
+            #pragma unroll
+            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                
+                #pragma unroll
+                for (int m = 0; m < num_m_elements; ++m) {
+                    
+                    // Check if this M coordinate is within valid sequence length
+                    int m_coord = get<0>(t0QcQ(vec, m, _0{}));  // Get the global M coordinate
+                    bool m_is_valid = (m_coord < max_valid_m);
+                    
+                    if (m_is_valid) {
+                        // This M row is valid, process all K elements
+                        
+                        #pragma unroll
+                        for (int k = 0; k < num_k_elements; ++k) {
+                            
+                            // Check if this K coordinate is within valid head dimension
+                            bool k_is_valid = tQpQ(k);  // Predicate we computed earlier
+                            
+                            if (k_is_valid) {
+                                // Both M and K are valid - do the actual copy
+                                // This is typically a vectorized load (e.g., 128-bit)
+                                
+                                // Get source element from global memory
+                                Element value = tQgQ(vec, m, k);
+                                
+                                // Write to shared memory
+                                tQsQ(vec, m, k) = value;
+                                
+                            } else {
+                                // K is out of bounds - write zero to shared memory
+                                // (prevents garbage values from affecting MMA computation)
+                                tQsQ(vec, m, k) = Element(0);
+                            }
+                        }
+                        
+                    } else {
+                        // This M row is out of bounds
+                        // With Clear_OOB_MN=false, we do nothing (optimization)
+                        // The output will be masked later anyway
+                        // (If Clear_OOB_MN were true, we'd zero the entire row here)
+                    }
+                }
+            }
         //} else {
         //    using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
         //    PackGQAt::load_Q(mQ, sQ, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
@@ -450,6 +517,7 @@ struct CollectiveMainloopFwdSm80 {
             //if constexpr (!PagedKV) {
                 // Do we need bound check to make sure the row doesn't go above kBlockN
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
+            #if 0
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);
                 // Instead of passing in tKVcKV, we pass in t0KVcKV and subtract the offset from the limit
                 // (seqlen_k - n_block * kBlockN). This is because the entries of t0KVcKV are known at compile time.
@@ -459,6 +527,101 @@ struct CollectiveMainloopFwdSm80 {
                 // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
                 flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
                     gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK_cur, t0KVcKV, tKVpKV, seqlenk_row_limit);
+                #else
+                // ============================================================================
+                // MANUAL REWRITE - What it does under the hood:
+                // ============================================================================
+
+                // Step 1: Extract current K tile for this n_block and pipeline stage
+                // tKsK has shape: (KCPY, KCPY_N, KCPY_K, kStages)
+                // tKgK has shape: (KCPY, KCPY_N, KCPY_K, num_blocks)
+                Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);  // Select pipeline stage
+                Tensor tKgK_cur = tKgK(_, _, _, n_block);          // Select K block
+
+                // Step 2: Calculate the N dimension limit (similar to Q's M limit)
+                // This is more complex than V because it handles the compile-time optimization better
+
+                // First, get the thread 0's N coordinate offset
+                int const thread0_n_offset = get<0>(tKVcKV(_0{}, _0{}, _0{}));
+
+                // Calculate the limit based on whether we need masking
+                int const seqlenk_row_limit = -thread0_n_offset + (EvenN
+                    ? seqlen_info.seqlen_k - n_block * kBlockN           // Simple case: just remaining rows
+                    : (!Seqlenk_mask 
+                        ? kBlockN                                         // No masking: use full tile
+                        : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN)));  // Masking: min of remaining and tile
+
+                // Step 3: Determine template parameters for flash::copy
+                constexpr bool Is_even_MN = !Seqlenk_mask && EvenN;  // Perfect alignment: no N checking needed
+                constexpr bool Is_even_K = false;                     // Always check K (head_dim might not align)
+                constexpr bool Clear_OOB_MN = false;                  // Don't zero invalid N rows (will mask in scores)
+                constexpr bool Clear_OOB_K = true;                    // DO zero invalid K columns (prevent garbage)
+
+                // Step 4: Get tensor dimensions
+                int const num_vec_copies = size<0>(tKgK_cur);  // e.g., 2
+                int const num_n_elements = size<1>(tKgK_cur);  // e.g., 4
+                int const num_k_elements = size<2>(tKgK_cur);  // e.g., 8
+
+                // Step 5: Triple nested loop with bounds checking
+                #pragma unroll
+                for (int vec = 0; vec < num_vec_copies; ++vec) {
+                    
+                    #pragma unroll
+                    for (int n = 0; n < num_n_elements; ++n) {
+                        
+                        // Get the N coordinate for this element (relative to block start)
+                        // Using t0KVcKV (thread 0's coordinates) for compile-time optimization
+                        int n_coord = get<0>(t0KVcKV(vec, n, _0{}));
+                        
+                        // Check if this N coordinate is within valid sequence length
+                        bool n_is_valid;
+                        if (Is_even_MN) {
+                            // Perfect alignment: all N coords valid (compile-time known)
+                            n_is_valid = true;
+                        } else {
+                            // Need runtime check
+                            n_is_valid = (n_coord < seqlenk_row_limit);
+                        }
+                        
+                        if (n_is_valid) {
+                            // This N row is valid, process all K elements
+                            
+                            #pragma unroll
+                            for (int k = 0; k < num_k_elements; ++k) {
+                                
+                                // Check if this K coordinate is within valid head dimension
+                                bool k_is_valid = tKVpKV(k);  // Pre-computed K predicate
+                                
+                                if (k_is_valid) {
+                                    // Both N and K are valid - do the actual copy
+                                    // Load from global memory (128-bit vectorized)
+                                    Element value = tKgK_cur(vec, n, k);
+
+                                    // Write to shared memory
+                                    tKsK_cur(vec, n, k) = value;
+                                    
+                                } else {
+                                    // K is out of bounds - write zero to shared memory
+                                    // This prevents garbage from affecting Q×K^T computation
+                                    tKsK_cur(vec, n, k) = Element(0);
+                                }
+                            }
+                            
+                        } else {
+
+                                printf("%d %d\n", vec, n);
+
+                            // This N row is out of bounds
+                            // With Clear_OOB_MN=false, we do NOTHING (optimization!)
+                            // Comment from code: "We don't need to clear the sK smem tiles 
+                            // since we'll mask out the scores anyway."
+                            //
+                            // The attention scores S = Q×K^T will be masked later, so
+                            // garbage in out-of-bounds K rows won't affect the final output.
+                        }
+                    }
+                }
+                #endif
             //} else {
             //    paged_kv_manager.template load_page_table<Seqlenk_mask>(n_block);
             //    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
@@ -470,6 +633,7 @@ struct CollectiveMainloopFwdSm80 {
             //if constexpr (!PagedKV) {
                 // Do we need bound check to make sure the row doesn't go above kBlockN
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
+                #if 0
                 Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_write);
                 // We don't call flash::copy since it doesn't support bound checking
                 // to not overshot kBlockN when writing to smem.
@@ -486,6 +650,84 @@ struct CollectiveMainloopFwdSm80 {
                         }
                     }
                 }
+                #else
+                // ============================================================================
+                // MANUAL REWRITE - What it does under the hood:
+                // ============================================================================
+
+                // Step 1: Extract current V tile for this n_block and pipeline stage
+                // tVsV has shape: (VCOPY, MMA_N, MMA_K, kStages)
+                // tVgV has shape: (VCOPY, MMA_N, MMA_K, num_blocks)
+                Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_write);  // Select pipeline stage
+                Tensor tVgV_cur = tVgV(_, _, _, n_block);          // Select K/V block
+
+                // Step 2: Calculate how many valid rows in this K block
+                // Similar to Q, but for the K/V sequence dimension
+                int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
+
+                // Step 3: Get tensor dimensions
+                int const num_vec_copies = size<0>(tVsV_cur);  // e.g., 2
+                int const num_n_elements = size<1>(tVsV_cur);  // e.g., 4 (N dimension)
+                int const num_k_elements = size<2>(tVsV_cur);  // e.g., 8 (K dimension)
+
+                // Step 4: Nested loops with TWO levels of predicates
+                #pragma unroll
+                for (int m = 0; m < num_n_elements; ++m) {
+                    
+                    // First predicate: Check if this N row is within tile bounds (kBlockN)
+                    // This is for when kBlockN doesn't evenly divide into the thread layout
+                    bool row_within_tile;
+                    if (EvenN) {
+                        // If kBlockN is evenly divisible, all rows are within tile
+                        row_within_tile = true;
+                    } else {
+                        // Check if this is the last row OR if it's within kBlockN
+                        row_within_tile = (m < num_n_elements - 1) || 
+                                        (get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN);
+                    }
+                    
+                    if (row_within_tile) {
+                        // Second predicate: Check if this N row is within sequence bounds
+                        int n_coord = get<0>(t0KVcKV(_0{}, m, _0{}));  // Global N coordinate
+                        bool row_within_sequence;
+                        
+                        if (Seqlenk_mask) {
+                            // Need to check sequence bounds (last K block might be partial)
+                            row_within_sequence = (n_coord < seqlenk_row_limit);
+                        } else {
+                            // No masking needed (not the last block, or even division)
+                            row_within_sequence = true;
+                        }
+                        
+                        // Combined N predicate
+                        bool const predicate_n = row_within_sequence;
+                        
+                        // Now loop over K dimension
+                        #pragma unroll
+                        for (int k = 0; k < num_k_elements; ++k) {
+                            
+                            // K predicate (head dimension bounds)
+                            bool const predicate_k = tKVpKV(k);  // Pre-computed K validity
+                            
+                            // Combined predicate: both N and K must be valid
+                            bool const predicate_both = predicate_k && predicate_n;
+                            
+                            // Now copy each vectorized element
+                            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                                if (predicate_both) {
+                                    // Both N and K valid: Copy data
+                                    Element value = tVgV_cur(vec, m, k);  // Read from global memory
+                                    tVsV_cur(vec, m, k) = value;          // Write to shared memory
+                                } else {
+                                    // Either N or K invalid: Zero (prevents garbage in MMA)
+                                    tVsV_cur(vec, m, k) = Element(0);
+                                }
+                            }
+                        }
+                    }
+                    // If !row_within_tile, skip this row entirely (out of tile bounds)
+                }
+                #endif
             //} else {
             //    paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV(_, _, smem_pipe_write));
             //}
