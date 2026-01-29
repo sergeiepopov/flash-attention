@@ -424,13 +424,14 @@ struct CollectiveMainloopFwdSm80 {
             {
                 tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q);
             }
+#if 0
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
             // (seqlen_q - m_block * kBlockM). This is because the entries of t0QcQ are known at compile time.
             // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-            //flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-            //    gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
-            //);
-
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
+                gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
+            );
+#else
             // ============================================================================
             // MANUAL REWRITE - What it does under the hood:
             // ============================================================================
@@ -447,6 +448,16 @@ struct CollectiveMainloopFwdSm80 {
             int const num_vec_copies = size<0>(tQgQ);  // e.g., 2
             int const num_m_elements = size<1>(tQgQ);  // e.g., 4  
             int const num_k_elements = size<2>(tQgQ);  // e.g., 8
+
+            //printf("%d %d %d %d %d %d %d\n", num_vec_copies, num_m_elements, num_k_elements, (int)size<0>(tKgK), (int)size<1>(tKgK), (int)size<2>(tKgK), (int)size<3>(tKgK));
+            if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
+            {
+                printf("seqlen_k = %d\n", seqlen_info.seqlen_k);
+                printf("kHeadDim = %d\n", kHeadDim);
+                printf("kGmemElemsPerLoad = %d\n", kGmemElemsPerLoad);
+                printf("kBlockN = %d, kBlockK = %d\n", kBlockN, kHeadDim);
+                printf("num K blocks = %d\n", (seqlen_info.seqlen_k + kBlockN - 1) / kBlockN);
+			}
 
             // Step 3: Triple nested loop with bounds checking
             #pragma unroll
@@ -493,22 +504,23 @@ struct CollectiveMainloopFwdSm80 {
                     }
                 }
             }
+#endif
         //} else {
         //    using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
         //    PackGQAt::load_Q(mQ, sQ, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
         //}
         cute::cp_async_fence();
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
-        PagedKVManager_t paged_kv_manager(
-            params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
-            params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.headdim_v, params.stride_V,
-            params.page_size_divmod,
-            params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
-            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
-        );
+        //using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
+        //PagedKVManager_t paged_kv_manager(
+        //    params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+        //    params.ptr_K, params.shape_K, params.stride_K,
+        //    params.ptr_V, params.headdim_v, params.stride_V,
+        //    params.page_size_divmod,
+        //    params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
+        //    bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+        //    0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
+        //);
 
         //printf("debug: %d %d %d %d %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, kStages, kBlockM, kBlockN, kHeadDim, n_block_min, n_block_max);
 
@@ -608,9 +620,6 @@ struct CollectiveMainloopFwdSm80 {
                             }
                             
                         } else {
-
-                                printf("%d %d\n", vec, n);
-
                             // This N row is out of bounds
                             // With Clear_OOB_MN=false, we do NOTHING (optimization!)
                             // Comment from code: "We don't need to clear the sK smem tiles 
