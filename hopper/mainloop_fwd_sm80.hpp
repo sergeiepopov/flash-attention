@@ -84,9 +84,9 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
     static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
     using SmemLayoutAtomQKV = decltype(
-        composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
+        //composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
                     Layout<Shape<_8, Int<kBlockKGmem>>,
-                           Stride<Int<kBlockKGmem>, _1>>{}));
+                           Stride<Int<kBlockKGmem>, _1>>{}/*)*/);
     using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{})));
 
     using SmemLayoutK = decltype(tile_to_shape(
