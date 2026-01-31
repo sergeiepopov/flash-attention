@@ -190,11 +190,11 @@ public:
                 params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 params.mainloop.seqlens_rotary
             };
-            if constexpr (AppendKV) {
-                bool tile_new_valid = mainloop.store_kv_new(
-                    params.mainloop, threadIdx.x, shared_storage, seqlen_info, block_coord);
-                if (tile_new_valid) { __syncthreads(); }
-            }
+            //if constexpr (AppendKV) {
+            //    bool tile_new_valid = mainloop.store_kv_new(
+            //        params.mainloop, threadIdx.x, shared_storage, seqlen_info, block_coord);
+            //    if (tile_new_valid) { __syncthreads(); }
+            //}
             bool tile_valid = mainloop.mma(
                 params.mainloop, tOrO, softmax, threadIdx.x, seqlen_info, block_coord,
                 shared_storage);

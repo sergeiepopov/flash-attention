@@ -23,6 +23,224 @@ namespace flash {
 
 using namespace cute;
 
+// ============================================================================
+// EDUCATIONAL: Understanding ldmatrix and Shared Memory → Register Transfer
+// ============================================================================
+//
+// This section explains how cute::copy works when loading matrix fragments
+// from shared memory to registers for Tensor Core operations.
+//
+// The key instruction is: ldmatrix.sync.aligned.x4.m8n8.shared.b16
+//
+// ============================================================================
+// LDMATRIX INSTRUCTION OVERVIEW
+// ============================================================================
+//
+// ldmatrix is a WARP-COOPERATIVE instruction. All 32 threads in a warp 
+// participate together to load matrix fragments optimized for tensor cores.
+//
+// Instruction: ldmatrix.sync.aligned.x4.m8n8.shared.b16 {d0,d1,d2,d3}, [addr]
+//
+//   - sync:    All threads must execute together (warp-synchronous)
+//   - aligned: Source address must be 16-byte aligned
+//   - x4:      Load 4 matrices simultaneously  
+//   - m8n8:    Each matrix is 8 rows × 8 columns
+//   - shared:  Source is in shared memory
+//   - b16:     Each element is 16 bits (half/bf16)
+//
+// ============================================================================
+// THREAD-TO-DATA MAPPING (for m8n8 with x4, loading 4 8×8 matrices)
+// ============================================================================
+//
+//   Shared Memory Layout (4 matrices, each 8×8 of fp16):
+//   ┌─────────────────────────────────────────────────────────────────┐
+//   │ Matrix 0 (8×8)  │ Matrix 1 (8×8)  │ Matrix 2 (8×8)  │ Matrix 3  │
+//   │ rows 0-7        │ rows 0-7        │ rows 0-7        │ rows 0-7  │
+//   └─────────────────────────────────────────────────────────────────┘
+//
+//   Thread Assignment:
+//   - Threads 0-7   provide addresses for rows 0-7 of Matrix 0
+//   - Threads 8-15  provide addresses for rows 0-7 of Matrix 1  
+//   - Threads 16-23 provide addresses for rows 0-7 of Matrix 2
+//   - Threads 24-31 provide addresses for rows 0-7 of Matrix 3
+//
+//   Each thread provides ONE address pointing to the START of ONE ROW (8 fp16 = 16 bytes)
+//
+//   After ldmatrix, each thread holds 4 registers (d0,d1,d2,d3):
+//   - d0: 2 fp16 values from matrix 0
+//   - d1: 2 fp16 values from matrix 1
+//   - d2: 2 fp16 values from matrix 2
+//   - d3: 2 fp16 values from matrix 3
+//
+// ============================================================================
+// VISUALIZATION: How 32 threads cooperatively load 4 matrices
+// ============================================================================
+//
+//   BEFORE (in Shared Memory):                AFTER (in Registers):
+//   
+//   Matrix 0 (smem):                          Thread 0: d0=M0[0,0:1], d1=M1[0,0:1], d2=M2[0,0:1], d3=M3[0,0:1]
+//   Row 0: [a0 a1 a2 a3 a4 a5 a6 a7] ←T0     Thread 1: d0=M0[1,0:1], d1=M1[1,0:1], d2=M2[1,0:1], d3=M3[1,0:1]
+//   Row 1: [b0 b1 b2 b3 b4 b5 b6 b7] ←T1     ...
+//   ...                                       Thread 7: d0=M0[7,0:1], d1=M1[7,0:1], d2=M2[7,0:1], d3=M3[7,0:1]
+//   Row 7: [h0 h1 h2 h3 h4 h5 h6 h7] ←T7     
+//                                             Thread 8:  d0=M0[0,2:3], d1=M1[0,2:3], ...
+//   Matrix 1 (smem):                          Thread 9:  d0=M0[1,2:3], d1=M1[1,2:3], ...
+//   Row 0: [i0 i1 i2 i3 i4 i5 i6 i7] ←T8     ...
+//   ...                                       Thread 31: d0=M0[7,6:7], d1=M1[7,6:7], ...
+//
+//   The data gets REDISTRIBUTED across threads in a pattern optimized for MMA!
+//
+// ============================================================================
+
+// ============================================================================
+// EDUCATIONAL COPY: Direct ldmatrix implementation with full explanation
+// ============================================================================
+// This function implements the smem→register copy WITHOUT calling cute::copy,
+// showing exactly how the ldmatrix instruction works.
+//
+// Key insight from CuTe's copy_unpack:
+//   1. RECAST source tensor to uint128_t (16 bytes = what ldmatrix loads)
+//   2. RECAST destination tensor to uint32_t (4 registers = what ldmatrix produces)
+//   3. Call the ldmatrix PTX with individual tensor elements
+//
+// The CuTe tensor layout ALREADY encodes swizzle patterns and thread mappings.
+// ============================================================================
+template<typename TiledCopy, typename TensorS, typename TensorD>
+CUTLASS_DEVICE void educational_copy_smem_to_regs(
+    TiledCopy const& tiled_copy,  // Copy descriptor (unused, kept for API compat)
+    TensorS const& src,           // Source: shared memory tensor slice
+    TensorD& dst)                 // Destination: register tensor slice
+{
+    // ========================================================================
+    // STEP 1: RECAST tensors to match ldmatrix register types
+    // ========================================================================
+    // This is exactly what CuTe's copy_unpack does internally!
+    //
+    // For SM75_U32x4_LDSM_N:
+    //   - SRegisters = uint128_t[1]  →  source is 1 × 16-byte chunk
+    //   - DRegisters = uint32_t[4]   →  destination is 4 × 4-byte registers
+    //
+    // recast<uint128_t>(src) reinterprets the fp16 tensor as uint128_t:
+    //   - Original: 8 × fp16 elements = 16 bytes
+    //   - Recast:   1 × uint128_t element = 16 bytes
+    //
+    // recast<uint32_t>(dst) reinterprets the fp16 tensor as uint32_t:
+    //   - Original: 8 × fp16 elements = 16 bytes  
+    //   - Recast:   4 × uint32_t elements = 16 bytes
+    //
+    Tensor src_u128 = recast<uint128_t const>(src);  // View as uint128_t
+    Tensor dst_u32  = recast<uint32_t>(dst);         // View as uint32_t
+    
+    // ========================================================================
+    // STEP 2: Verify sizes match ldmatrix expectations
+    // ========================================================================
+    // After recast:
+    //   - src_u128 should have 1 element per ldmatrix call
+    //   - dst_u32 should have 4 elements per ldmatrix call
+    //
+    // The tensor shapes are now:
+    //   src_u128: (1, NUM_REPEATS) or (NUM_REPEATS,) if 1D
+    //   dst_u32:  (4, NUM_REPEATS) or (4 * NUM_REPEATS,) if 1D
+    
+    // ========================================================================
+    // STEP 3: Issue ldmatrix for each atom
+    // ========================================================================
+    // CuTe's detail::explode calls CopyOp::copy(src(0), dst(0), dst(1), dst(2), dst(3))
+    // We replicate this pattern directly.
+    
+    // 2D tensor: loop over repeats
+    // src_u128 has shape (1, NUM_REPEATS), dst_u32 has shape (4, NUM_REPEATS)
+        
+    #pragma unroll
+    for (int m = 0; m < size<1>(src_u128); ++m) {
+        // Get source address for this repeat
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}, m));
+            
+        // Get destination registers for this repeat
+        uint32_t& r0 = dst_u32(_0{}, m);
+        uint32_t& r1 = dst_u32(_1{}, m);
+        uint32_t& r2 = dst_u32(_2{}, m);
+        uint32_t& r3 = dst_u32(_3{}, m);
+            
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
+// TRANSPOSED VERSION: For loading V matrix with .trans modifier
+// ============================================================================
+// V is stored transposed in smem for coalesced global→smem loads.
+// ldmatrix.trans loads AND transposes in a single instruction.
+// ============================================================================
+template<typename TiledCopy, typename TensorS, typename TensorD>
+CUTLASS_DEVICE void educational_copy_smem_to_regs_transposed(
+    TiledCopy const& tiled_copy,
+    TensorS const& src,
+    TensorD& dst)
+{
+    // Same recast pattern as non-transposed version
+    Tensor src_u128 = recast<uint128_t const>(src);
+    Tensor dst_u32  = recast<uint32_t>(dst);
+    
+    if constexpr (decltype(rank(src_u128))::value == 1) {
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}));
+        uint32_t& r0 = dst_u32(_0{});
+        uint32_t& r1 = dst_u32(_1{});
+        uint32_t& r2 = dst_u32(_2{});
+        uint32_t& r3 = dst_u32(_3{});
+        
+        // .trans modifier: loads AND transposes the 8×8 matrix
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+    } else {
+        #pragma unroll
+        for (int m = 0; m < size<1>(src_u128); ++m) {
+            uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}, m));
+            uint32_t& r0 = dst_u32(_0{}, m);
+            uint32_t& r1 = dst_u32(_1{}, m);
+            uint32_t& r2 = dst_u32(_2{}, m);
+            uint32_t& r3 = dst_u32(_3{}, m);
+            
+            asm volatile(
+                "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                : "r"(smem_addr)
+            );
+        }
+    }
+}
+
+// ============================================================================
+// HOW cute::copy ORCHESTRATES THIS
+// ============================================================================
+//
+// When you call: cute::copy(smem_tiled_copy, tSsQ(_, _, k), tCrQ_copy_view(_, _, k))
+//
+// CuTe does the following:
+//
+// 1. PARTITION: The TiledCopy divides the tile among threads
+//    - smem_thr_copy_Q.partition_S(sQ) → creates thread's view of source
+//    - smem_thr_copy_Q.retile_D(tSrQ) → creates thread's view of destination regs
+//
+// 2. ADDRESS CALCULATION: For each thread, compute smem address
+//    - Uses the Layout to map (thread_id, value_id) → memory offset
+//    - Handles swizzling patterns for bank conflict avoidance
+//
+// 3. DISPATCH TO PTX: Based on Copy_Atom type, select instruction
+//    - SM75_U32x4_LDSM_N → ldmatrix.sync.aligned.x4.m8n8.shared.b16
+//    - SM75_U16x8_LDSM_T → ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 (transposed)
+//
+// 4. EXECUTE: All threads in warp execute ldmatrix together
+//
+// ============================================================================
+
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
         bool PackGQA_, bool Split_>
@@ -872,10 +1090,163 @@ struct CollectiveMainloopFwdSm80 {
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+#if 0
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
             );
+#else
+            // ============================================================================
+            // INLINED gemm_sm80: Computes S = Q × K^T using Tensor Cores
+            // 
+            // This performs a tiled matrix multiplication where:
+            //   - tSrS:     Accumulator in registers (output: attention scores)
+            //   - tSrQ_cur: Q tile fragment in registers (may need loading from smem)
+            //   - tSrK:     K tile fragment in registers (needs loading from smem)
+            //   - tSsQ:     Q tile in shared memory (source for loading)
+            //   - tSsK:     K tile in shared memory (source for loading)
+            //
+            // The K dimension is split into multiple "k_block" iterations.
+            // Each iteration loads a slice and performs MMA (Matrix Multiply-Accumulate).
+            // ============================================================================
+            {
+                // Get the current K tile from shared memory (handles pipeline staging)
+                auto tCsK_cur = tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0);
+                
+                // Create "retiled" views that match the hardware's expected register layout
+                // for the LDSM (Load Shared Memory) instructions.
+                // These views remap the logical tensor indices to the physical register layout
+                // that Tensor Cores expect for efficient matrix fragment loading.
+                Tensor tCrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ_cur);  // Retiled view for Q
+                Tensor tCrK_copy_view = smem_thr_copy_K.retile_D(tSrK);      // Retiled view for K
+                
+                // ========================================================================
+                // PHASE 1: Load first K-slice (k=0) from Shared Memory → Registers
+                // ========================================================================
+                //
+                // WHAT cute::copy DOES INTERNALLY (see educational_ldmatrix_x4 above):
+                //
+                // 1. Get source tensor slice: tSsQ(_, _, _0{}) 
+                //    - This is Q's k=0 slice in shared memory
+                //    - Shape: (M_tile, K_slice) e.g., (64, 16) for 64 rows, 16 columns
+                //
+                // 2. Get destination register view: tCrQ_copy_view(_, _, _0{})
+                //    - This is the register fragment for k=0, RETILED for ldmatrix layout
+                //    - The retile_D() call transformed the MMA register layout to LDSM layout
+                //
+                // 3. Internally iterates over sub-tiles that fit ldmatrix:
+                //    - For M=64, K=16 with ldmatrix loading 8x8 matrices:
+                //      Need (64/8) × (16/8) = 8 × 2 = 16 ldmatrix calls (distributed across warps)
+                //
+                // 4. For each sub-tile, executes:
+                //    a) Each thread computes its smem address (with swizzle for bank conflicts)
+                //    b) All 32 threads call: ldmatrix.sync.aligned.x4.m8n8.shared.b16
+                //    c) Data lands in registers in MMA-ready layout
+                //
+                // The actual PTX generated (per ldmatrix call):
+                //   ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%r0,%r1,%r2,%r3}, [%smem_addr];
+                //
+                // Load Q[*, *, k=0] from shared memory to registers (if not already in regs)
+                //if constexpr (!Q_in_regs) {
+                    // EDUCATIONAL: Using our custom copy function that shows ldmatrix internals
+                    flash::educational_copy_smem_to_regs(
+                        smem_tiled_copy_Q,           // Copy descriptor with layout info
+                        tSsQ(_, _, _0{}),            // Source: Q slice k=0 in shared memory
+                        tCrQ_copy_view(_, _, _0{})); // Dest: Q fragment k=0 in registers
+                //}
+                // Load K[*, *, k=0] from shared memory to registers
+                // For K, we use the same mechanism but K may have different swizzle pattern
+                flash::educational_copy_smem_to_regs(
+                    smem_tiled_copy_K,               // Copy descriptor
+                    tCsK_cur(_, _, _0{}),            // Source: K slice k=0 in shared memory
+                    tCrK_copy_view(_, _, _0{}));     // Dest: K fragment k=0 in registers
+                
+                // ========================================================================
+                // PHASE 2: Main K-dimension loop with software pipelining
+                // ========================================================================
+                // Loop over K dimension tiles. The key optimization is:
+                // - While computing MMA for tile k, we prefetch tile k+1 from smem
+                // - This hides memory latency behind compute
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(tSrQ_cur); ++k_block) {
+                    
+                    // --------------------------------------------------------------------
+                    // PREFETCH: Load NEXT k-slice while current MMA is in flight
+                    // --------------------------------------------------------------------
+                    // SOFTWARE PIPELINING: The key insight is that ldmatrix and mma.sync
+                    // can execute concurrently! While the tensor cores compute on k_block,
+                    // we load k_block+1 data.
+                    //
+                    // Timeline (simplified):
+                    //   Cycle N:   ldmatrix(k=1) starts | mma(k=0) starts
+                    //   Cycle N+1: ldmatrix(k=1) runs   | mma(k=0) runs  
+                    //   Cycle N+2: ldmatrix(k=1) done   | mma(k=0) runs
+                    //   Cycle N+3:                      | mma(k=0) done
+                    //   Cycle N+4: ldmatrix(k=2) starts | mma(k=1) starts (uses data from ldmatrix k=1)
+                    //
+                    // The registers are double-buffered implicitly by using different
+                    // k indices: we write to tCrQ[k+1] while reading from tCrQ[k]
+                    //
+                    if (k_block < size<2>(tSrQ_cur) - 1) {
+                        // Load Q[*, *, k+1] into registers - ldmatrix executes
+                        //if constexpr (!Q_in_regs) {
+                            // EDUCATIONAL: Prefetch next Q slice using our educational copy
+                            flash::educational_copy_smem_to_regs(
+                                smem_tiled_copy_Q,
+                                tSsQ(_, _, k_block + 1),
+                                tCrQ_copy_view(_, _, k_block + 1));
+                        //}
+                        // Load K[*, *, k+1] into registers
+                        // EDUCATIONAL: Prefetch next K slice using our educational copy
+                        flash::educational_copy_smem_to_regs(
+                            smem_tiled_copy_K,
+                            tCsK_cur(_, _, k_block + 1),
+                            tCrK_copy_view(_, _, k_block + 1));
+                    }
+                    
+                    // --------------------------------------------------------------------
+                    // HOOK: Execute callback on first iteration (loads V asynchronously)
+                    // --------------------------------------------------------------------
+                    // This is where we kick off async loading of V for the P×V GEMM
+                    // while we're still computing S = Q×K^T
+                    if (k_block == 0) {
+                        load_V_next();  // Initiates cp.async to load V tile into smem
+                    }
+                    
+                    // --------------------------------------------------------------------
+                    // TENSOR CORE MMA: The actual matrix multiply-accumulate
+                    // --------------------------------------------------------------------
+                    // This is where the magic happens! cute::gemm dispatches to:
+                    //   PTX: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+                    // 
+                    // What this instruction does:
+                    //   - Takes 16x16 tile of Q (A matrix) from registers
+                    //   - Takes 16x8 tile of K^T (B matrix) from registers  
+                    //   - Computes C += A × B using Tensor Cores
+                    //   - All 32 threads in warp cooperate; each holds fragment of result
+                    //
+                    // Register layout (per thread in warp, for m16n8k16 with fp16→fp32):
+                    //   A fragment: 8 half values (16 bytes)
+                    //   B fragment: 4 half values (8 bytes)
+                    //   C fragment: 4 float values (16 bytes)
+                    //
+                    // The tiled_mma handles multiple MMA instructions to cover the full
+                    // tile size (e.g., 64x64 tile = multiple 16x8x16 MMAs)
+                    cute::gemm(tiled_mma, tSrQ_cur(_, _, k_block), tSrK(_, _, k_block), tSrS);
+                    
+                    // After this instruction, tSrS accumulates: S += Q_k × K_k^T
+                    // The accumulator is in fp32 for numerical precision
+                }
+            }
+            // ============================================================================
+            // END INLINED gemm_sm80
+            // 
+            // At this point:
+            //   - tSrS contains the attention scores S = Q × K^T (in registers, fp32)
+            //   - V tile loading (cp.async) is in flight to shared memory
+            //   - Ready for softmax and then P×V multiplication
+            // ============================================================================
+#endif
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             //scoremod_premask_fn(tSrS);
             // Faster to load_K before gemm if we only have 1 stage
@@ -900,7 +1271,100 @@ struct CollectiveMainloopFwdSm80 {
             //    sync();
             //}
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
+#if 0
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, /*kStages > 1 ? smem_pipe_read : */0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+#else
+            // ============================================================================
+            // INLINED gemm_rs_sm80: Computes O += P × V using Tensor Cores
+            // 
+            // "RS" = Register-Smem: A matrix (P) is already in registers, only B (V) 
+            // needs to be loaded from shared memory.
+            //
+            // This is more efficient than gemm_sm80 because:
+            //   - P (softmax output) is still hot in registers from previous computation
+            //   - No need to spill P to shared memory and reload it
+            //   - Only V needs smem→register transfer
+            //
+            // Variables:
+            //   - tOrO:  Output accumulator in registers (O += P × V)
+            //   - tOrP:  P matrix (softmax output) already in registers
+            //   - tOrV:  V tile fragment in registers (loaded from smem)
+            //   - tOsVt: V tile in shared memory (transposed layout for coalescing)
+            // ============================================================================
+            {
+                // Get the current V tile from shared memory
+                auto tCsV_cur = tOsVt(_, _, _, /*kStages > 1 ? smem_pipe_read : */0);
+                
+                // Create retiled view for V that matches ldmatrix register layout
+                Tensor tCrV_copy_view = smem_thr_copy_V.retile_D(tOrV);
+                
+                // ========================================================================
+                // PHASE 1: Load first K-slice of V from Shared Memory → Registers
+                // ========================================================================
+                //
+                // V is stored TRANSPOSED in smem (as Vt) for two reasons:
+                // 1. Better global→smem coalescing when loading V from HBM
+                // 2. The ldmatrix.trans instruction can load and transpose in one op
+                //
+                // For V, we use SM75_U16x8_LDSM_T (the "T" = Transposed variant):
+                //   PTX: ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {regs}, [smem]
+                //
+                // The .trans modifier tells the hardware to transpose the 8×8 matrix
+                // during the load, so we get column-major data into row-major registers.
+                //
+                // Memory layout (V transposed in smem):    Register layout (after load):
+                //   Col 0: [v00 v10 v20 ... v70]            Thread 0: gets v00,v01 from row 0
+                //   Col 1: [v01 v11 v21 ... v71]            Thread 1: gets v10,v11 from row 1
+                //   ...                                     ...
+                //
+                // EDUCATIONAL: Using transposed copy for V (loads and transposes in one op)
+                flash::educational_copy_smem_to_regs_transposed(
+                    smem_tiled_copy_V,               // Copy descriptor (contains LDSM_T atom)
+                    tCsV_cur(_, _, _0{}),            // Source: V slice k=0 in shared memory
+                    tCrV_copy_view(_, _, _0{}));     // Dest: V fragment k=0 in registers
+                
+                // ========================================================================
+                // PHASE 2: Main K-dimension loop (P × V accumulation)
+                // ========================================================================
+                // Similar pipelining as gemm_sm80, but simpler since P is already in regs
+                #pragma unroll
+                for (int k_block = 0; k_block < size<2>(tOrP); ++k_block) {
+                    
+                    // --------------------------------------------------------------------
+                    // PREFETCH: Load NEXT k-slice of V while current MMA executes
+                    // --------------------------------------------------------------------
+                    if (k_block < size<2>(tOrP) - 1) {
+                        // EDUCATIONAL: Prefetch next V slice with transpose
+                        flash::educational_copy_smem_to_regs_transposed(
+                            smem_tiled_copy_V,
+                            tCsV_cur(_, _, k_block + 1),
+                            tCrV_copy_view(_, _, k_block + 1));
+                    }
+                    
+                    // --------------------------------------------------------------------
+                    // TENSOR CORE MMA: O += P_k × V_k
+                    // --------------------------------------------------------------------
+                    // PTX: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+                    //
+                    // P_k is a slice of the softmax probabilities (in registers)
+                    // V_k is a slice of the value matrix (just loaded from smem)
+                    //
+                    // The output O accumulates across all K iterations:
+                    //   O = Σ_k (P_k × V_k)
+                    //
+                    // This is the weighted sum of values, where weights are attention probs
+                    cute::gemm(tiled_mma, tOrP(_, _, k_block), tOrV(_, _, k_block), tOrO);
+                }
+            }
+            // ============================================================================
+            // END INLINED gemm_rs_sm80
+            //
+            // At this point:
+            //   - tOrO contains accumulated output O += P × V (in registers, fp32)
+            //   - This completes one block of the flash attention computation
+            //   - Loop continues to next KV block until all blocks processed
+            // ============================================================================
+#endif
             //if constexpr (kStages > 1)
             //{
             //    load_K_next();
@@ -964,6 +1428,7 @@ struct CollectiveMainloopFwdSm80 {
                  SeqlenInfo_t const& seqlen_info,
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
+#if 0
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         auto n_block_new_min_max = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
@@ -1145,7 +1610,7 @@ struct CollectiveMainloopFwdSm80 {
             }
             cute::cp_async_fence();
         }
-
+#endif
         return true;
 
     }
