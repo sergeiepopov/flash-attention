@@ -1232,6 +1232,40 @@ struct CollectiveMainloopFwdSm80 {
                     //
                     // The tiled_mma handles multiple MMA instructions to cover the full
                     // tile size (e.g., 64x64 tile = multiple 16x8x16 MMAs)
+                    
+                    // ================================================================
+                    // DEBUG: Print MMA sizes (only from thread 0, block 0, first iter)
+                    // ================================================================
+                    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
+                        // TileShape from template parameters
+                        printf("\n========== MMA SIZE DEBUG ==========\n");
+                        printf("TileShape_MNK: M=%d, N=%d, K=%d\n", 
+                               kBlockM, kBlockN, kHeadDim);
+                        
+                        // TiledMma shape: Tile<M, N, K> using tile_shape() function
+                        auto mma_tile = tile_shape(tiled_mma);
+                        printf("TiledMma Tile Shape: M=%d, N=%d, K=%d\n",
+                               int(size<0>(mma_tile)),
+                               int(size<1>(mma_tile)),
+                               int(size<2>(mma_tile)));
+                        
+                        // Number of threads
+                        printf("NumMmaThreads: %d (kNWarps=%d)\n", NumMmaThreads, kNWarps);
+                        
+                        // Fragment shapes (per thread)
+                        printf("tSrQ_cur shape: (%d, %d, %d)\n",
+                               int(size<0>(tSrQ_cur)), int(size<1>(tSrQ_cur)), int(size<2>(tSrQ_cur)));
+                        printf("tSrK shape: (%d, %d, %d)\n",
+                               int(size<0>(tSrK)), int(size<1>(tSrK)), int(size<2>(tSrK)));
+                        printf("tSrS shape: (%d, %d, %d)\n",
+                               int(size<0>(tSrS)), int(size<1>(tSrS)), int(size<2>(tSrS)));
+                        
+                        // MMA Atom info
+                        printf("MMA Atom: SM80_16x8x16_F32F16F16F32_TN\n");
+                        printf("PTX: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+                        printf("====================================\n\n");
+                    }
+                    
                     cute::gemm(tiled_mma, tSrQ_cur(_, _, k_block), tSrK(_, _, k_block), tSrS);
                     
                     // After this instruction, tSrS accumulates: S += Q_k × K_k^T
@@ -1353,6 +1387,21 @@ struct CollectiveMainloopFwdSm80 {
                     //   O = Σ_k (P_k × V_k)
                     //
                     // This is the weighted sum of values, where weights are attention probs
+                    
+                    // ================================================================
+                    // DEBUG: Print P×V GEMM sizes (only once)
+                    // ================================================================
+                    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
+                        printf("\n========== P×V GEMM DEBUG ==========\n");
+                        printf("tOrP shape: (%d, %d, %d)\n",
+                               int(size<0>(tOrP)), int(size<1>(tOrP)), int(size<2>(tOrP)));
+                        printf("tOrV shape: (%d, %d, %d)\n",
+                               int(size<0>(tOrV)), int(size<1>(tOrV)), int(size<2>(tOrV)));
+                        printf("tOrO shape: (%d, %d, %d)\n",
+                               int(size<0>(tOrO)), int(size<1>(tOrO)), int(size<2>(tOrO)));
+                        printf("=====================================\n\n");
+                    }
+                    
                     cute::gemm(tiled_mma, tOrP(_, _, k_block), tOrV(_, _, k_block), tOrO);
                 }
             }
