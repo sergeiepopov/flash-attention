@@ -6,9 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# User points this at the CUTLASS root (the folder that contains "include\cutlass\cutlass.h")
-set(CUTLASS_ROOT "C:/source/cutlass" CACHE PATH "Path to CUTLASS root directory")
-set(CMAKE_PREFIX_PATH "C:/Program Files/Python313/Lib/site-packages/torch/share/cmake" CACHE PATH "Path to CUTLASS root directory")
+set(CMAKE_PREFIX_PATH "C:/Program Files/Python314/Lib/site-packages/torch/share/cmake" CACHE PATH "Path to CUTLASS root directory")
 
 # Options to speed up compilation by disabling features (all disabled by default for faster builds)
 option(FLASHATTENTION_DISABLE_BACKWARD "Disable backward pass" ON)
@@ -30,30 +28,26 @@ option(FLASHATTENTION_DISABLE_HDIM128 "Disable head dimension 128" ON)
 option(FLASHATTENTION_DISABLE_HDIM192 "Disable head dimension 192" ON)
 option(FLASHATTENTION_DISABLE_HDIM256 "Disable head dimension 256" ON)
 
-if(NOT CUTLASS_ROOT)
-  message(FATAL_ERROR "Set -DCUTLASS_ROOT=C:/path/to/cutlass")
-endif()
-
 # CUTLASS core headers
 find_path(CUTLASS_INCLUDE_DIR
   NAMES cutlass/cutlass.h
-  PATHS "${CUTLASS_ROOT}/include"
+  PATHS "csrc/cutlass/include"
   NO_DEFAULT_PATH
 )
 
 # Optional: CUTLASS util headers (used by many examples)
 find_path(CUTLASS_UTIL_INCLUDE_DIR
   NAMES cutlass/util/device_memory.h
-  PATHS "${CUTLASS_ROOT}/tools/util/include"
+  PATHS "csrc/cutlass/tools/util/include"
   NO_DEFAULT_PATH
 )
 
 if(NOT CUTLASS_INCLUDE_DIR)
-  message(FATAL_ERROR "Could not find cutlass/cutlass.h under ${CUTLASS_ROOT}/include")
+  message(FATAL_ERROR "Could not find cutlass/cutlass.h under csrc/cutlass/include")
 endif()
 
 # Force CMake to use release Python libraries even in Debug builds
-# This avoids the "cannot open file 'python313_d.lib'" error on Windows
+# This avoids the "cannot open file 'python314_d.lib'" error on Windows
 if(WIN32)
   set(Python3_USE_DEBUG_LIBS OFF CACHE BOOL "" FORCE)
 endif()
@@ -263,8 +257,8 @@ if(WIN32)
   )
   # Force linker to ignore debug Python library and use release version
   target_link_options(flash-attention PRIVATE
-    $<$<CONFIG:Debug>:/NODEFAULTLIB:python313_d.lib>
-    $<$<CONFIG:Debug>:python313.lib>
+    $<$<CONFIG:Debug>:/NODEFAULTLIB:python314_d.lib>
+    $<$<CONFIG:Debug>:python314.lib>
   )
   # Add the Python library directory to the linker search path
   if(Python3_LIBRARY_DIRS)
