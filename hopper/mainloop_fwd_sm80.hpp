@@ -591,6 +591,27 @@ struct CollectiveMainloopFwdSm80 {
         Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
         Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
+        if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            print("tKgK shape: ");
+            print(shape(tKgK));
+            print("\n");
+            print("tKgK stride: ");
+            print(stride(tKgK));
+            print("\n");
+            print("tKgK layout: ");
+            print(layout(tKgK));
+            print("\n");
+
+            // For a specific slice:
+            print("tKgK(_,_,_,0) layout: ");
+            print(layout(tKgK(_, _, _, 0)));
+            print("\n");
+        }
+
+        if (thread_idx == 0) {
+            //print_tensor(tKgK(_, _, _, 0));  // Print first block
+        }
+
         TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_slice(thread_idx);
 
@@ -1090,7 +1111,78 @@ struct CollectiveMainloopFwdSm80 {
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+
+// ============================================================================
+// SWITCH: Change #if 0 to #if 1 to use FULLY MANUAL version (no CuTe tensors)
+// ============================================================================
 #if 0
+            // ================================================================
+            // FULLY MANUAL VERSION: Simple scalar math that ACTUALLY WORKS
+            // ================================================================
+            // This version:
+            // 1. Uses simple for-loops instead of ldmatrix/MMA
+            // 2. Writes results directly to tSrS using CuTe's coordinate mapping
+            // 3. Produces correct results (but is MUCH slower than tensor cores)
+            //
+            // KEY INSIGHT: tSrS is a CuTe tensor where each thread owns certain
+            // (m,n) output elements. We use thr_mma.partition_C() on an identity
+            // tensor to get the coordinate mapping, then compute dot products.
+            // ================================================================
+            {
+                // Get raw pointers to shared memory (row-major layout)
+                half_t const* smem_Q_ptr = reinterpret_cast<half_t const*>(shared_storage.tensors.mainloop.smem_q.data());
+                half_t const* smem_K_ptr = reinterpret_cast<half_t const*>(shared_storage.tensors.mainloop.smem_k.data());
+                
+                // Create an identity tensor to get coordinate mapping
+                // This maps tSrS element index → (m, n) coordinate in output matrix
+                auto cS = thr_mma.partition_C(make_identity_tensor(
+                    make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+                
+                // Debug print (only once)
+                if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0 && n_block == n_block_max - 1) {
+                    printf("\n======== MANUAL GEMM (WORKING VERSION) ========\n");
+                    printf("Computing S = Q × K^T using scalar FMA\n");
+                    printf("Q in smem: [%d × %d]\n", kBlockM, kHeadDim);
+                    printf("K in smem: [%d × %d]\n", kBlockN, kHeadDim);
+                    printf("Output S:  [%d × %d]\n", kBlockM, kBlockN);
+                    printf("Elements per thread (tSrS size): %d\n", (int)size(tSrS));
+                    printf("==============================================\n\n");
+                }
+                
+                // ============================================================
+                // MAIN COMPUTATION: For each element in tSrS, compute dot product
+                // ============================================================
+                #pragma unroll
+                for (int i = 0; i < size(tSrS); ++i) {
+                    // Get the (m, n) output coordinate for element i
+                    auto coord = cS(i);
+                    int m = get<0>(coord);
+                    int n = get<1>(coord);
+                    
+                    // Compute dot product: S[m,n] = sum_k Q[m,k] * K[n,k]
+                    float sum = 0.0f;
+                    
+                    if (m < kBlockM && n < kBlockN) {
+                        #pragma unroll
+                        for (int k = 0; k < kHeadDim; ++k) {
+                            // Q[m][k] - row m, column k
+                            float q_val = float(smem_Q_ptr[m * kHeadDim + k]);
+                            // K[n][k] - row n, column k (K^T means we want column n of K^T = row n of K)
+                            float k_val = float(smem_K_ptr[n * kHeadDim + k]);
+                            sum += q_val * k_val;
+                        }
+                    }
+                    // else: out of bounds, keep sum = 0
+                    
+                    // Store to register accumulator
+                    tSrS(i) = sum;
+                }
+                
+                // Trigger async V loading
+                load_V_next();
+            }
+
+#elif 0
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next

@@ -76,7 +76,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using AttnKernel = std::conditional_t<
         Arch >= 90,
         flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
-        flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
+        /*flash::enable_sm80_to_sm89<*/flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>/*>*/
     >;
 
     bool const is_varlen_q = params.cu_seqlens_q;
@@ -172,7 +172,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
-    int smem_size = AttnKernel::SharedStorageSize;
+    int smem_size = AttnKernel::SharedStorageSize + 1;
     // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
     // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
     // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
@@ -197,6 +197,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         if (cutlassStatus != cutlass::Status::kSuccess) {
             fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cutlass::cutlassGetStatusString(cutlassStatus));
         }
+        CHECK_CUDA(cudaDeviceSynchronize());
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 }

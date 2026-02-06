@@ -1851,7 +1851,7 @@ int main(int argc, char ** argv) {
         // Create random input tensors on CUDA
         auto options = torch::TensorOptions()
             .dtype(torch::kFloat16)
-            .device(torch::kCUDA, 0);
+            .device(torch::kCUDA);
 
         auto q = torch::randn({ batch_size, seqlen_q, num_heads, head_dim }, options);
         auto k = torch::randn({ batch_size, seqlen_k, num_heads, head_dim }, options);
