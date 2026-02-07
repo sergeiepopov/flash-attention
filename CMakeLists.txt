@@ -6,7 +6,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-set(CMAKE_PREFIX_PATH "C:/Program Files/Python314/Lib/site-packages/torch/share/cmake" CACHE PATH "Path to CUTLASS root directory")
+# Force CMake to use release Python libraries even in Debug builds
+# This avoids the "cannot open file 'python314_d.lib'" error on Windows
+if(WIN32)
+  set(Python3_USE_DEBUG_LIBS OFF CACHE BOOL "" FORCE)
+endif()
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import site; print(site.getsitepackages()[1])"
+    OUTPUT_VARIABLE PYTHON_SITE_PACKAGES_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+message(STATUS "Python site-packages path: ${PYTHON_SITE_PACKAGES_PATH}")
+set(CMAKE_PREFIX_PATH "${PYTHON_SITE_PACKAGES_PATH}/torch/share/cmake" CACHE PATH "Path to CUTLASS root directory")
 
 # Options to speed up compilation by disabling features (all disabled by default for faster builds)
 option(FLASHATTENTION_DISABLE_BACKWARD "Disable backward pass" ON)
@@ -45,14 +59,6 @@ find_path(CUTLASS_UTIL_INCLUDE_DIR
 if(NOT CUTLASS_INCLUDE_DIR)
   message(FATAL_ERROR "Could not find cutlass/cutlass.h under csrc/cutlass/include")
 endif()
-
-# Force CMake to use release Python libraries even in Debug builds
-# This avoids the "cannot open file 'python314_d.lib'" error on Windows
-if(WIN32)
-  set(Python3_USE_DEBUG_LIBS OFF CACHE BOOL "" FORCE)
-endif()
-
-find_package(Python3 REQUIRED COMPONENTS Development.Module)
 
 # Force use of release Python libraries on Windows for all build configurations
 if(WIN32 AND TARGET Python3::Module)

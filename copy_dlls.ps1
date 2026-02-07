@@ -2,7 +2,7 @@
 
 # Find PyTorch installation
 $pythonCmd = "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
-$torchLibPath = python -c $pythonCmd
+$torchLibPath = py -c $pythonCmd
 
 Write-Host "PyTorch lib path: $torchLibPath"
 
@@ -31,12 +31,12 @@ foreach ($buildPath in $buildPaths) {
 }
 
 # Also check for Python DLL
-$pythonDllPath = python -c "import sys; import os; print(os.path.join(sys.prefix, 'python313.dll'))"
+$pythonDllPath = python -c "import sys; import os; print(os.path.join(sys.prefix, 'python314.dll'))"
 if (Test-Path $pythonDllPath) {
     foreach ($buildPath in $buildPaths) {
         if (Test-Path "$buildPath\flash-attention.exe") {
             Copy-Item $pythonDllPath -Destination $buildPath -Force
-            Write-Host "  Copied: python313.dll"
+            Write-Host "  Copied: python314.dll"
         }
     }
 }

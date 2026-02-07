@@ -171,6 +171,52 @@ CUTLASS_DEVICE void educational_copy_smem_to_regs(
 }
 
 // ============================================================================
+// SM75 x2 VARIANTS: ldmatrix.sync.aligned.x2.m8n8.shared.b16 (2 regs per load)
+// Used when MMA is SM75_16x8x8 (smaller fragment → copy atom is U32x2 / U16x4).
+// ============================================================================
+template<typename TiledCopy, typename TensorS, typename TensorD>
+CUTLASS_DEVICE void educational_copy_smem_to_regs_x2(
+    TiledCopy const& tiled_copy,
+    TensorS const& src,
+    TensorD& dst)
+{
+    Tensor src_u128 = recast<uint128_t const>(src);
+    Tensor dst_u32  = recast<uint32_t>(dst);
+    #pragma unroll
+    for (int m = 0; m < size<1>(src_u128); ++m) {
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}, m));
+        uint32_t& r0 = dst_u32(_0{}, m);
+        uint32_t& r1 = dst_u32(_1{}, m);
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+template<typename TiledCopy, typename TensorS, typename TensorD>
+CUTLASS_DEVICE void educational_copy_smem_to_regs_transposed_x2(
+    TiledCopy const& tiled_copy,
+    TensorS const& src,
+    TensorD& dst)
+{
+    Tensor src_u128 = recast<uint128_t const>(src);
+    Tensor dst_u32  = recast<uint32_t>(dst);
+    #pragma unroll
+    for (int m = 0; m < size<1>(src_u128); ++m) {
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}, m));
+        uint32_t& r0 = dst_u32(_0{}, m);
+        uint32_t& r1 = dst_u32(_1{}, m);
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
 // TRANSPOSED VERSION: For loading V matrix with .trans modifier
 // ============================================================================
 // V is stored transposed in smem for coalesced global→smem loads.
@@ -185,35 +231,20 @@ CUTLASS_DEVICE void educational_copy_smem_to_regs_transposed(
     // Same recast pattern as non-transposed version
     Tensor src_u128 = recast<uint128_t const>(src);
     Tensor dst_u32  = recast<uint32_t>(dst);
-    
-    if constexpr (decltype(rank(src_u128))::value == 1) {
-        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}));
-        uint32_t& r0 = dst_u32(_0{});
-        uint32_t& r1 = dst_u32(_1{});
-        uint32_t& r2 = dst_u32(_2{});
-        uint32_t& r3 = dst_u32(_3{});
+
+    #pragma unroll
+    for (int m = 0; m < size<1>(src_u128); ++m) {
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}, m));
+        uint32_t& r0 = dst_u32(_0{}, m);
+        uint32_t& r1 = dst_u32(_1{}, m);
+        uint32_t& r2 = dst_u32(_2{}, m);
+        uint32_t& r3 = dst_u32(_3{}, m);
         
-        // .trans modifier: loads AND transposes the 8×8 matrix
         asm volatile(
             "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
             : "r"(smem_addr)
         );
-    } else {
-        #pragma unroll
-        for (int m = 0; m < size<1>(src_u128); ++m) {
-            uint32_t smem_addr = cute::cast_smem_ptr_to_uint(&src_u128(_0{}, m));
-            uint32_t& r0 = dst_u32(_0{}, m);
-            uint32_t& r1 = dst_u32(_1{}, m);
-            uint32_t& r2 = dst_u32(_2{}, m);
-            uint32_t& r3 = dst_u32(_3{}, m);
-            
-            asm volatile(
-                "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                : "r"(smem_addr)
-            );
-        }
     }
 }
 
@@ -264,7 +295,7 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool Split = Split_;
     static constexpr bool Transpose_V = Is_FP8;
 
-    static_assert(ArchTag::kMinComputeCapability >= 80);
+    static_assert(ArchTag::kMinComputeCapability >= 75);
 
     static constexpr bool Has_cp_async = /*ArchTag::kMinComputeCapability >= 80*/false;
 
@@ -275,8 +306,10 @@ struct CollectiveMainloopFwdSm80 {
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
+    // SM80: 16x8x16 MMA atom → tile K = 16.  SM75: 16x8x8 MMA atom → tile K = 8.
+    static constexpr bool UseSM80MMA = /*ArchTag::kMinComputeCapability >= 80*/ false;
     using MMA_Atom_Arch = std::conditional_t<
-        ArchTag::kMinComputeCapability >= 80,
+        UseSM80MMA,
         std::conditional_t<
             std::is_same_v<Element, cutlass::half_t>,
             MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
@@ -284,10 +317,11 @@ struct CollectiveMainloopFwdSm80 {
         >,
         MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>
     >;
+    using MmaTileK = std::conditional_t<UseSM80MMA, _16, _8>;
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
-        Tile<Int<16 * kNWarps>, _16, _16>>;
+        Tile<Int<16 * kNWarps>, _16, MmaTileK>>;
 
     static constexpr int NumMmaThreads = size(TiledMma{});
     static constexpr int NumProducerThreads = NumMmaThreads;  // For compatibility with TileScheduler
@@ -319,8 +353,9 @@ struct CollectiveMainloopFwdSm80 {
                     make_ordered_layout(make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
                                         Step<_2, _1, _3>{})));
 
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
+    // SM75 16x8x8 MMA yields fewer vals per thread; need x2/x4 LDSM atoms so TiledNumVal % AtomNumVal.
+    using SmemCopyAtom = Copy_Atom<std::conditional_t<UseSM80MMA, SM75_U32x4_LDSM_N, SM75_U32x2_LDSM_N>, Element>;
+    using SmemCopyAtomTransposed = Copy_Atom<std::conditional_t<UseSM80MMA, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>, Element>;
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
@@ -591,7 +626,8 @@ struct CollectiveMainloopFwdSm80 {
         Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
         Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
-        if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+        if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+        {
             print("tKgK shape: ");
             print(shape(tKgK));
             print("\n");
@@ -670,7 +706,7 @@ struct CollectiveMainloopFwdSm80 {
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
                 gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
             );
-#else
+#elif 0
             // ============================================================================
             // MANUAL REWRITE - What it does under the hood:
             // ============================================================================
@@ -732,6 +768,84 @@ struct CollectiveMainloopFwdSm80 {
                                 // K is out of bounds - write zero to shared memory
                                 // (prevents garbage values from affecting MMA computation)
                                 tQsQ(vec, m, k) = Element(0);
+                            }
+                        }
+                        
+                    } else {
+                        // This M row is out of bounds
+                        // With Clear_OOB_MN=false, we do nothing (optimization)
+                        // The output will be masked later anyway
+                        // (If Clear_OOB_MN were true, we'd zero the entire row here)
+                    }
+                }
+            }
+#else
+            // ============================================================================
+            // MANUAL REWRITE - What it does under the hood:
+            // ============================================================================
+
+            // Step 1: Calculate the M dimension limit (how many valid rows in this tile)
+            int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}));
+
+            // Step 2: Get tensor dimensions
+            // tQgQ and tQsQ have shape (VCOPY, MMA_M, MMA_K)
+            // - VCOPY: Number of vectorized copies per thread (e.g., 2)
+            // - MMA_M: Number of M elements this thread handles (e.g., 4)
+            // - MMA_K: Number of K elements this thread handles (e.g., 8)
+
+            int const num_vec_copies = size<0>(tQgQ);  // e.g., 2
+            int const num_m_elements = size<1>(tQgQ);  // e.g., 4  
+            int const num_k_elements = size<2>(tQgQ);  // e.g., 8
+            // Strides as ints (from layout once); index in loop is manual only
+            int const stride_v = static_cast<int>(tQgQ.layout()(1, 0, 0));
+            int const stride_m = static_cast<int>(tQgQ.layout()(0, 1, 0));
+            int const stride_k = static_cast<int>(tQgQ.layout()(0, 0, 1));
+            int const stride_sv = static_cast<int>(tQsQ.layout()(1, 0, 0));
+            int const stride_sm = static_cast<int>(tQsQ.layout()(0, 1, 0));
+            int const stride_sk = static_cast<int>(tQsQ.layout()(0, 0, 1));
+
+            //printf("%d %d %d %d %d %d %d\n", num_vec_copies, num_m_elements, num_k_elements, (int)size<0>(tKgK), (int)size<1>(tKgK), (int)size<2>(tKgK), (int)size<3>(tKgK));
+            if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
+            {
+                printf("seqlen_k = %d\n", seqlen_info.seqlen_k);
+                printf("kHeadDim = %d\n", kHeadDim);
+                printf("kGmemElemsPerLoad = %d\n", kGmemElemsPerLoad);
+                printf("kBlockN = %d, kBlockK = %d\n", kBlockN, kHeadDim);
+                printf("num K blocks = %d\n", (seqlen_info.seqlen_k + kBlockN - 1) / kBlockN);
+			}
+
+            // Step 3: Triple nested loop with bounds checking
+            #pragma unroll
+            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                
+                #pragma unroll
+                for (int m = 0; m < num_m_elements; ++m) {
+                    
+                    // Check if this M coordinate is within valid sequence length
+                    int m_coord = get<0>(t0QcQ(vec, m, _0{}));  // Get the global M coordinate
+                    bool m_is_valid = (m_coord < max_valid_m);
+                    
+                    if (m_is_valid) {
+                        // This M row is valid, process all K elements
+                        
+                        #pragma unroll
+                        for (int k = 0; k < num_k_elements; ++k) {
+                            // Shared-memory write index (manual)
+                            Element* smem_base = raw_pointer_cast(tQsQ.data());
+                            int const offset_s = vec * stride_sv + m * stride_sm + k * stride_sk;
+                            
+                            // Check if this K coordinate is within valid head dimension
+                            bool k_is_valid = tQpQ(k);  // Predicate we computed earlier
+                            
+                            if (k_is_valid) {
+                                // Both M and K are valid - do the actual copy
+                                Element const* gmem_base = raw_pointer_cast(tQgQ.data());
+                                int const offset = vec * stride_v + m * stride_m + k * stride_k;
+                                Element value = gmem_base[offset];
+                                smem_base[offset_s] = value;
+                            } else {
+                                // K is out of bounds - write zero to shared memory
+                                smem_base[offset_s] = Element(0);
                             }
                         }
                         
@@ -1240,18 +1354,22 @@ struct CollectiveMainloopFwdSm80 {
                 //
                 // Load Q[*, *, k=0] from shared memory to registers (if not already in regs)
                 //if constexpr (!Q_in_regs) {
-                    // EDUCATIONAL: Using our custom copy function that shows ldmatrix internals
+                if constexpr (UseSM80MMA) {
                     flash::educational_copy_smem_to_regs(
-                        smem_tiled_copy_Q,           // Copy descriptor with layout info
-                        tSsQ(_, _, _0{}),            // Source: Q slice k=0 in shared memory
-                        tCrQ_copy_view(_, _, _0{})); // Dest: Q fragment k=0 in registers
+                        smem_tiled_copy_Q, tSsQ(_, _, _0{}), tCrQ_copy_view(_, _, _0{}));
+                } else {
+                    flash::educational_copy_smem_to_regs_x2(
+                        smem_tiled_copy_Q, tSsQ(_, _, _0{}), tCrQ_copy_view(_, _, _0{}));
+                }
                 //}
                 // Load K[*, *, k=0] from shared memory to registers
-                // For K, we use the same mechanism but K may have different swizzle pattern
-                flash::educational_copy_smem_to_regs(
-                    smem_tiled_copy_K,               // Copy descriptor
-                    tCsK_cur(_, _, _0{}),            // Source: K slice k=0 in shared memory
-                    tCrK_copy_view(_, _, _0{}));     // Dest: K fragment k=0 in registers
+                if constexpr (UseSM80MMA) {
+                    flash::educational_copy_smem_to_regs(
+                        smem_tiled_copy_K, tCsK_cur(_, _, _0{}), tCrK_copy_view(_, _, _0{}));
+                } else {
+                    flash::educational_copy_smem_to_regs_x2(
+                        smem_tiled_copy_K, tCsK_cur(_, _, _0{}), tCrK_copy_view(_, _, _0{}));
+                }
                 
                 // ========================================================================
                 // PHASE 2: Main K-dimension loop with software pipelining
@@ -1280,20 +1398,17 @@ struct CollectiveMainloopFwdSm80 {
                     // k indices: we write to tCrQ[k+1] while reading from tCrQ[k]
                     //
                     if (k_block < size<2>(tSrQ_cur) - 1) {
-                        // Load Q[*, *, k+1] into registers - ldmatrix executes
-                        //if constexpr (!Q_in_regs) {
-                            // EDUCATIONAL: Prefetch next Q slice using our educational copy
+                        if constexpr (UseSM80MMA) {
                             flash::educational_copy_smem_to_regs(
-                                smem_tiled_copy_Q,
-                                tSsQ(_, _, k_block + 1),
-                                tCrQ_copy_view(_, _, k_block + 1));
-                        //}
-                        // Load K[*, *, k+1] into registers
-                        // EDUCATIONAL: Prefetch next K slice using our educational copy
-                        flash::educational_copy_smem_to_regs(
-                            smem_tiled_copy_K,
-                            tCsK_cur(_, _, k_block + 1),
-                            tCrK_copy_view(_, _, k_block + 1));
+                                smem_tiled_copy_Q, tSsQ(_, _, k_block + 1), tCrQ_copy_view(_, _, k_block + 1));
+                            flash::educational_copy_smem_to_regs(
+                                smem_tiled_copy_K, tCsK_cur(_, _, k_block + 1), tCrK_copy_view(_, _, k_block + 1));
+                        } else {
+                            flash::educational_copy_smem_to_regs_x2(
+                                smem_tiled_copy_Q, tSsQ(_, _, k_block + 1), tCrQ_copy_view(_, _, k_block + 1));
+                            flash::educational_copy_smem_to_regs_x2(
+                                smem_tiled_copy_K, tCsK_cur(_, _, k_block + 1), tCrK_copy_view(_, _, k_block + 1));
+                        }
                     }
                     
                     // --------------------------------------------------------------------
@@ -1353,8 +1468,8 @@ struct CollectiveMainloopFwdSm80 {
                                int(size<0>(tSrS)), int(size<1>(tSrS)), int(size<2>(tSrS)));
                         
                         // MMA Atom info
-                        printf("MMA Atom: SM80_16x8x16_F32F16F16F32_TN\n");
-                        printf("PTX: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+                        printf("MMA Atom: %s\n", UseSM80MMA ? "SM80_16x8x16_F32F16F16F32_TN" : "SM75_16x8x8_F32F16F16F32_TN");
+                        printf("PTX: %s\n", UseSM80MMA ? "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" : "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32");
                         printf("====================================\n\n");
                     }
                     
@@ -1443,11 +1558,13 @@ struct CollectiveMainloopFwdSm80 {
                 //   Col 1: [v01 v11 v21 ... v71]            Thread 1: gets v10,v11 from row 1
                 //   ...                                     ...
                 //
-                // EDUCATIONAL: Using transposed copy for V (loads and transposes in one op)
-                flash::educational_copy_smem_to_regs_transposed(
-                    smem_tiled_copy_V,               // Copy descriptor (contains LDSM_T atom)
-                    tCsV_cur(_, _, _0{}),            // Source: V slice k=0 in shared memory
-                    tCrV_copy_view(_, _, _0{}));     // Dest: V fragment k=0 in registers
+                if constexpr (UseSM80MMA) {
+                    flash::educational_copy_smem_to_regs_transposed(
+                        smem_tiled_copy_V, tCsV_cur(_, _, _0{}), tCrV_copy_view(_, _, _0{}));
+                } else {
+                    flash::educational_copy_smem_to_regs_transposed_x2(
+                        smem_tiled_copy_V, tCsV_cur(_, _, _0{}), tCrV_copy_view(_, _, _0{}));
+                }
                 
                 // ========================================================================
                 // PHASE 2: Main K-dimension loop (P × V accumulation)
@@ -1460,11 +1577,13 @@ struct CollectiveMainloopFwdSm80 {
                     // PREFETCH: Load NEXT k-slice of V while current MMA executes
                     // --------------------------------------------------------------------
                     if (k_block < size<2>(tOrP) - 1) {
-                        // EDUCATIONAL: Prefetch next V slice with transpose
-                        flash::educational_copy_smem_to_regs_transposed(
-                            smem_tiled_copy_V,
-                            tCsV_cur(_, _, k_block + 1),
-                            tCrV_copy_view(_, _, k_block + 1));
+                        if constexpr (UseSM80MMA) {
+                            flash::educational_copy_smem_to_regs_transposed(
+                                smem_tiled_copy_V, tCsV_cur(_, _, k_block + 1), tCrV_copy_view(_, _, k_block + 1));
+                        } else {
+                            flash::educational_copy_smem_to_regs_transposed_x2(
+                                smem_tiled_copy_V, tCsV_cur(_, _, k_block + 1), tCrV_copy_view(_, _, k_block + 1));
+                        }
                     }
                     
                     // --------------------------------------------------------------------
