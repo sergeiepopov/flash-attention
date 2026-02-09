@@ -699,6 +699,13 @@ struct CollectiveMainloopFwdSm80 {
             {
                 tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q);
             }
+            // Print thread's tQsQ base offset from start of sQ (in elements)
+            if (bidh == 0 && bidb == 0 && m_block == 0) {
+                Element const* sQ_base = raw_pointer_cast(gQ.data());
+                Element const* tQsQ_base = raw_pointer_cast(tQgQ.data());
+                ptrdiff_t offset_elems = tQsQ_base - sQ_base;
+                printf("thread_idx=%d tQsQ_offset_from_sQ=%lld\n", thread_idx, offset_elems);
+            }
 #if 0
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
             // (seqlen_q - m_block * kBlockM). This is because the entries of t0QcQ are known at compile time.
@@ -803,10 +810,20 @@ struct CollectiveMainloopFwdSm80 {
             int const stride_sv = static_cast<int>(tQsQ.layout()(1, 0, 0));
             int const stride_sm = static_cast<int>(tQsQ.layout()(0, 1, 0));
             int const stride_sk = static_cast<int>(tQsQ.layout()(0, 0, 1));
+            // Partition follows GmemLayoutAtom: (NumMmaThreads/kGmemThreadsPerRow, kGmemThreadsPerRow) with stride (kGmemThreadsPerRow, 1).
+            // Thread base = (thread_row)*row_stride + (thread_col)*threads_along_k; row_stride = (kHeadDim/2)*kGmemThreadsPerRow (smem layout).
+            int const threads_along_k = kGmemThreadsPerRow;
+            int const thread_base_row_stride = (kHeadDim / 2) * kGmemThreadsPerRow;
+            int const thread_base_offset = (thread_idx / threads_along_k) * thread_base_row_stride + (thread_idx % threads_along_k) * threads_along_k;
+            Element const* gmem_tile_base = raw_pointer_cast(gQ.data());
+            Element* smem_tile_base = raw_pointer_cast(sQ.data());
 
             //printf("%d %d %d %d %d %d %d\n", num_vec_copies, num_m_elements, num_k_elements, (int)size<0>(tKgK), (int)size<1>(tKgK), (int)size<2>(tKgK), (int)size<3>(tKgK));
             if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
             {
+                printf("num_vec_copies = %d\n", num_vec_copies);
+                printf("num_m_elements = %d\n", num_m_elements);
+                printf("num_k_elements = %d\n", num_k_elements);
                 printf("seqlen_k = %d\n", seqlen_info.seqlen_k);
                 printf("kHeadDim = %d\n", kHeadDim);
                 printf("kGmemElemsPerLoad = %d\n", kGmemElemsPerLoad);
@@ -830,22 +847,19 @@ struct CollectiveMainloopFwdSm80 {
                         
                         #pragma unroll
                         for (int k = 0; k < num_k_elements; ++k) {
-                            // Shared-memory write index (manual)
-                            Element* smem_base = raw_pointer_cast(tQsQ.data());
                             int const offset_s = vec * stride_sv + m * stride_sm + k * stride_sk;
-                            
+                            int const smem_idx = thread_idx * threads_along_k + offset_s;
+
                             // Check if this K coordinate is within valid head dimension
                             bool k_is_valid = tQpQ(k);  // Predicate we computed earlier
-                            
+
                             if (k_is_valid) {
-                                // Both M and K are valid - do the actual copy
-                                Element const* gmem_base = raw_pointer_cast(tQgQ.data());
-                                int const offset = vec * stride_v + m * stride_m + k * stride_k;
-                                Element value = gmem_base[offset];
-                                smem_base[offset_s] = value;
+                                int const offset_g = vec * stride_v + m * stride_m + k * stride_k;
+                                int const gmem_idx = thread_base_offset + offset_g;
+                                Element value = gmem_tile_base[gmem_idx];
+                                smem_tile_base[smem_idx] = value;
                             } else {
-                                // K is out of bounds - write zero to shared memory
-                                smem_base[offset_s] = Element(0);
+                                smem_tile_base[smem_idx] = Element(0);
                             }
                         }
                         
