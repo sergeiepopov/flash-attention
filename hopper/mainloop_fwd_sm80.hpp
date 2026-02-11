@@ -699,13 +699,6 @@ struct CollectiveMainloopFwdSm80 {
             {
                 tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q);
             }
-            // Print thread's tQsQ base offset from start of sQ (in elements)
-            if (bidh == 0 && bidb == 0 && m_block == 0) {
-                Element const* sQ_base = raw_pointer_cast(gQ.data());
-                Element const* tQsQ_base = raw_pointer_cast(tQgQ.data());
-                ptrdiff_t offset_elems = tQsQ_base - sQ_base;
-                printf("thread_idx=%d tQsQ_offset_from_sQ=%lld\n", thread_idx, offset_elems);
-            }
 #if 0
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
             // (seqlen_q - m_block * kBlockM). This is because the entries of t0QcQ are known at compile time.
@@ -818,19 +811,6 @@ struct CollectiveMainloopFwdSm80 {
             Element const* gmem_tile_base = raw_pointer_cast(gQ.data());
             Element* smem_tile_base = raw_pointer_cast(sQ.data());
 
-            //printf("%d %d %d %d %d %d %d\n", num_vec_copies, num_m_elements, num_k_elements, (int)size<0>(tKgK), (int)size<1>(tKgK), (int)size<2>(tKgK), (int)size<3>(tKgK));
-            if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
-            {
-                printf("num_vec_copies = %d\n", num_vec_copies);
-                printf("num_m_elements = %d\n", num_m_elements);
-                printf("num_k_elements = %d\n", num_k_elements);
-                printf("seqlen_k = %d\n", seqlen_info.seqlen_k);
-                printf("kHeadDim = %d\n", kHeadDim);
-                printf("kGmemElemsPerLoad = %d\n", kGmemElemsPerLoad);
-                printf("kBlockN = %d, kBlockK = %d\n", kBlockN, kHeadDim);
-                printf("num K blocks = %d\n", (seqlen_info.seqlen_k + kBlockN - 1) / kBlockN);
-			}
-
             // Step 3: Triple nested loop with bounds checking
             #pragma unroll
             for (int vec = 0; vec < num_vec_copies; ++vec) {
@@ -889,8 +869,6 @@ struct CollectiveMainloopFwdSm80 {
         //    0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         //);
 
-        //printf("debug: %d %d %d %d %d %d %d %d %d %d\n", m_block, bidh, bidb, split_idx, kStages, kBlockM, kBlockN, kHeadDim, n_block_min, n_block_max);
-
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
             //if constexpr (!PagedKV) {
@@ -916,6 +894,7 @@ struct CollectiveMainloopFwdSm80 {
                 // tKgK has shape: (KCPY, KCPY_N, KCPY_K, num_blocks)
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);  // Select pipeline stage
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);          // Select K block
+                Element * smem_tile_base = raw_pointer_cast(sK.data());
 
                 // Step 2: Calculate the N dimension limit (similar to Q's M limit)
                 // This is more complex than V because it handles the compile-time optimization better
@@ -937,9 +916,20 @@ struct CollectiveMainloopFwdSm80 {
                 constexpr bool Clear_OOB_K = true;                    // DO zero invalid K columns (prevent garbage)
 
                 // Step 4: Get tensor dimensions
-                int const num_vec_copies = size<0>(tKgK_cur);  // e.g., 2
-                int const num_n_elements = size<1>(tKgK_cur);  // e.g., 4
-                int const num_k_elements = size<2>(tKgK_cur);  // e.g., 8
+                int const num_vec_copies = size<0>(tKgK_cur);
+                int const num_n_elements = size<1>(tKgK_cur);
+                int const num_k_elements = size<2>(tKgK_cur);
+                int const thread_rows_K = NumMmaThreads / kGmemThreadsPerRow;
+                int const num_n_per_thread = kBlockN / thread_rows_K;
+                int const stride_sv = 1;
+                int const stride_sk = kGmemThreadsPerRow * num_n_per_thread;
+                //int const stride_stage = (kBlockN * kHeadDim) / NumMmaThreads;
+                //int const thread_base_offset_K = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow + (thread_idx % kGmemThreadsPerRow) * kGmemThreadsPerRow;
+
+                if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
+                {
+					printf("stride_sv=%d, stride_sm=%d, stride_sk=%d\n", stride_sv, stride_sm, stride_sk);
+                }
 
                 // Step 5: Triple nested loop with bounds checking
                 #pragma unroll
@@ -967,6 +957,8 @@ struct CollectiveMainloopFwdSm80 {
                             
                             #pragma unroll
                             for (int k = 0; k < num_k_elements; ++k) {
+                                int const offset_s = vec * stride_sv + n * stride_sm + k * stride_sk;
+                                int const smem_idx = thread_idx * threads_along_k + offset_s;
                                 
                                 // Check if this K coordinate is within valid head dimension
                                 bool k_is_valid = tKVpKV(k);  // Pre-computed K predicate
@@ -977,7 +969,8 @@ struct CollectiveMainloopFwdSm80 {
                                     Element value = tKgK_cur(vec, n, k);
 
                                     // Write to shared memory
-                                    tKsK_cur(vec, n, k) = value;
+                                    //tKsK_cur(vec, n, k) = value;
+                                    smem_tile_base[smem_idx] = value;
                                     
                                 } else {
                                     // K is out of bounds - write zero to shared memory
@@ -1266,17 +1259,6 @@ struct CollectiveMainloopFwdSm80 {
                 auto cS = thr_mma.partition_C(make_identity_tensor(
                     make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
                 
-                // Debug print (only once)
-                if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0 && n_block == n_block_max - 1) {
-                    printf("\n======== MANUAL GEMM (WORKING VERSION) ========\n");
-                    printf("Computing S = Q × K^T using scalar FMA\n");
-                    printf("Q in smem: [%d × %d]\n", kBlockM, kHeadDim);
-                    printf("K in smem: [%d × %d]\n", kBlockN, kHeadDim);
-                    printf("Output S:  [%d × %d]\n", kBlockM, kBlockN);
-                    printf("Elements per thread (tSrS size): %d\n", (int)size(tSrS));
-                    printf("==============================================\n\n");
-                }
-                
                 // ============================================================
                 // MAIN COMPUTATION: For each element in tSrS, compute dot product
                 // ============================================================
@@ -1457,35 +1439,35 @@ struct CollectiveMainloopFwdSm80 {
                     // ================================================================
                     // DEBUG: Print MMA sizes (only from thread 0, block 0, first iter)
                     // ================================================================
-                    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
-                        // TileShape from template parameters
-                        printf("\n========== MMA SIZE DEBUG ==========\n");
-                        printf("TileShape_MNK: M=%d, N=%d, K=%d\n", 
-                               kBlockM, kBlockN, kHeadDim);
-                        
-                        // TiledMma shape: Tile<M, N, K> using tile_shape() function
-                        auto mma_tile = tile_shape(tiled_mma);
-                        printf("TiledMma Tile Shape: M=%d, N=%d, K=%d\n",
-                               int(size<0>(mma_tile)),
-                               int(size<1>(mma_tile)),
-                               int(size<2>(mma_tile)));
-                        
-                        // Number of threads
-                        printf("NumMmaThreads: %d (kNWarps=%d)\n", NumMmaThreads, kNWarps);
-                        
-                        // Fragment shapes (per thread)
-                        printf("tSrQ_cur shape: (%d, %d, %d)\n",
-                               int(size<0>(tSrQ_cur)), int(size<1>(tSrQ_cur)), int(size<2>(tSrQ_cur)));
-                        printf("tSrK shape: (%d, %d, %d)\n",
-                               int(size<0>(tSrK)), int(size<1>(tSrK)), int(size<2>(tSrK)));
-                        printf("tSrS shape: (%d, %d, %d)\n",
-                               int(size<0>(tSrS)), int(size<1>(tSrS)), int(size<2>(tSrS)));
-                        
-                        // MMA Atom info
-                        printf("MMA Atom: %s\n", UseSM80MMA ? "SM80_16x8x16_F32F16F16F32_TN" : "SM75_16x8x8_F32F16F16F32_TN");
-                        printf("PTX: %s\n", UseSM80MMA ? "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" : "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32");
-                        printf("====================================\n\n");
-                    }
+                    //if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
+                    //    // TileShape from template parameters
+                    //    printf("\n========== MMA SIZE DEBUG ==========\n");
+                    //    printf("TileShape_MNK: M=%d, N=%d, K=%d\n", 
+                    //           kBlockM, kBlockN, kHeadDim);
+                    //    
+                    //    // TiledMma shape: Tile<M, N, K> using tile_shape() function
+                    //    auto mma_tile = tile_shape(tiled_mma);
+                    //    printf("TiledMma Tile Shape: M=%d, N=%d, K=%d\n",
+                    //           int(size<0>(mma_tile)),
+                    //           int(size<1>(mma_tile)),
+                    //           int(size<2>(mma_tile)));
+                    //    
+                    //    // Number of threads
+                    //    printf("NumMmaThreads: %d (kNWarps=%d)\n", NumMmaThreads, kNWarps);
+                    //    
+                    //    // Fragment shapes (per thread)
+                    //    printf("tSrQ_cur shape: (%d, %d, %d)\n",
+                    //           int(size<0>(tSrQ_cur)), int(size<1>(tSrQ_cur)), int(size<2>(tSrQ_cur)));
+                    //    printf("tSrK shape: (%d, %d, %d)\n",
+                    //           int(size<0>(tSrK)), int(size<1>(tSrK)), int(size<2>(tSrK)));
+                    //    printf("tSrS shape: (%d, %d, %d)\n",
+                    //           int(size<0>(tSrS)), int(size<1>(tSrS)), int(size<2>(tSrS)));
+                    //    
+                    //    // MMA Atom info
+                    //    printf("MMA Atom: %s\n", UseSM80MMA ? "SM80_16x8x16_F32F16F16F32_TN" : "SM75_16x8x8_F32F16F16F32_TN");
+                    //    printf("PTX: %s\n", UseSM80MMA ? "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" : "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32");
+                    //    printf("====================================\n\n");
+                    //}
                     
                     cute::gemm(tiled_mma, tSrQ_cur(_, _, k_block), tSrK(_, _, k_block), tSrS);
                     
@@ -1616,16 +1598,16 @@ struct CollectiveMainloopFwdSm80 {
                     // ================================================================
                     // DEBUG: Print P×V GEMM sizes (only once)
                     // ================================================================
-                    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
-                        printf("\n========== P×V GEMM DEBUG ==========\n");
-                        printf("tOrP shape: (%d, %d, %d)\n",
-                               int(size<0>(tOrP)), int(size<1>(tOrP)), int(size<2>(tOrP)));
-                        printf("tOrV shape: (%d, %d, %d)\n",
-                               int(size<0>(tOrV)), int(size<1>(tOrV)), int(size<2>(tOrV)));
-                        printf("tOrO shape: (%d, %d, %d)\n",
-                               int(size<0>(tOrO)), int(size<1>(tOrO)), int(size<2>(tOrO)));
-                        printf("=====================================\n\n");
-                    }
+                    //if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
+                    //    printf("\n========== P×V GEMM DEBUG ==========\n");
+                    //    printf("tOrP shape: (%d, %d, %d)\n",
+                    //           int(size<0>(tOrP)), int(size<1>(tOrP)), int(size<2>(tOrP)));
+                    //    printf("tOrV shape: (%d, %d, %d)\n",
+                    //           int(size<0>(tOrV)), int(size<1>(tOrV)), int(size<2>(tOrV)));
+                    //    printf("tOrO shape: (%d, %d, %d)\n",
+                    //           int(size<0>(tOrO)), int(size<1>(tOrO)), int(size<2>(tOrO)));
+                    //    printf("=====================================\n\n");
+                    //}
                     
                     cute::gemm(tiled_mma, tOrP(_, _, k_block), tOrV(_, _, k_block), tOrO);
                 }
