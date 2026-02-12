@@ -812,9 +812,14 @@ struct CollectiveMainloopFwdSm80 {
             int const stride_m_Q = thread_rows * stride_m_gmem;
             int const stride_k_Q = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
 #endif
-            int const stride_sv_Q = static_cast<int>(tQsQ.layout()(1, 0, 0));
-            int const stride_sm_Q = static_cast<int>(tQsQ.layout()(0, 1, 0));
-            int const stride_sk_Q = static_cast<int>(tQsQ.layout()(0, 0, 1));
+            // SmemLayoutQ is row-major (kBlockM, kHeadDim) with stride (kHeadDim, 1).
+            // Partition (vec, m, k) strides in smem:
+            //   vec: consecutive within a vectorized load → 1
+            //   m:   next row group for this thread → thread_rows * kHeadDim
+            //   k:   next K chunk → kBlockKGmem
+            static constexpr int stride_sv_Q = 1;
+            static constexpr int stride_sm_Q = thread_rows * kHeadDim;
+            static constexpr int stride_sk_Q = kBlockKGmem;
             // Partition follows GmemLayoutAtom: (NumMmaThreads/kGmemThreadsPerRow, kGmemThreadsPerRow) with stride (kGmemThreadsPerRow, 1).
             // Thread base = (thread_row)*row_stride + (thread_col)*threads_along_k; row_stride = (kHeadDim/2)*kGmemThreadsPerRow (smem layout).
             int const threads_along_k = kGmemThreadsPerRow;
@@ -984,7 +989,7 @@ struct CollectiveMainloopFwdSm80 {
                                 
                                 if (k_is_valid) {
                                     // Write to shared memory
-#if 0
+#if FLASH_USE_CUTLASS_TENSOR
                                     // Both N and K are valid - do the actual copy
                                     // Load from global memory (128-bit vectorized)
                                     Element value = tKgK_cur(vec, n, k);
@@ -998,7 +1003,11 @@ struct CollectiveMainloopFwdSm80 {
                                 } else {
                                     // K is out of bounds - write zero to shared memory
                                     // This prevents garbage from affecting Q×K^T computation
+#if FLASH_USE_CUTLASS_TENSOR
                                     tKsK_cur(vec, n, k) = Element(0);
+#else
+                                    smem_tile_base_K[smem_idx] = Element(0);
+#endif
                                 }
                             }
                             
