@@ -1069,16 +1069,17 @@ struct CollectiveMainloopFwdSm80 {
                 // gmem thread base: (thread_row * row_stride_gmem) + (thread_col * kGmemElemsPerLoad)
                 int const thread_base_gmem_V = (thread_idx / kGmemThreadsPerRow) * v_row_stride
                                              + (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad;
-                // smem partition strides: same atom (8, kBlockKGmem) tiled to (kBlockN, kHeadDim, kStages)
-                // stride_sv = 1 (vec contiguous), stride_sn = thread_rows * kBlockKGmem (jump thread_rows rows in smem atom)
-                // stride_stage = kBlockN * kHeadDim (total elements per stage tile)
-                int const stride_sv_V    = 1;
-                int const stride_sn_V    = thread_rows * kBlockKGmem;
-                int const stride_sk_V    = kBlockKGmem * kBlockN;  // only matters if num_k > 1
-                int const stride_stage_V = kBlockN * kHeadDim;
-                // smem thread base: same 2D pattern as Q (from the log)
-                int const thread_base_smem_V = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow
-                                             + (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad;
+                // Manual smem index calculation for V.
+                // SmemLayoutV is tile_to_shape of row-major atom (8, kBlockKGmem) → (kBlockN, kHeadDim, kStages).
+                // Physical offset = row * kHeadDim + col + stage * kBlockN * kHeadDim
+                //   row = thread_row + m * thread_rows
+                //   col = thread_col * kGmemElemsPerLoad + vec + k * kBlockKGmem
+                static constexpr int smem_row_stride_V  = kHeadDim;
+                static constexpr int smem_stage_stride_V = kBlockN * kHeadDim;
+                int const thread_row_V = thread_idx / kGmemThreadsPerRow;
+                int const thread_col_V = thread_idx % kGmemThreadsPerRow;
+                int const thread_base_smem_V = thread_row_V * smem_row_stride_V
+                                             + thread_col_V * kGmemElemsPerLoad;
                 Element const* gmem_tile_base_V = raw_pointer_cast(gV(_, _, n_block).data());
                 Element* smem_tile_base_V = raw_pointer_cast(sV.data());
 #endif
@@ -1116,8 +1117,11 @@ struct CollectiveMainloopFwdSm80 {
                                     tVsV_cur(vec, m, k) = Element(0);
                                 }
 #else
-                                int const offset_s_V = vec * stride_sv_V + m * stride_sn_V + k * stride_sk_V;
-                                int const smem_idx_V = thread_base_smem_V + smem_pipe_write * stride_stage_V + offset_s_V;
+                                int const smem_idx_V = thread_base_smem_V
+                                                     + m * thread_rows * smem_row_stride_V
+                                                     + vec
+                                                     + k * kBlockKGmem
+                                                     + smem_pipe_write * smem_stage_stride_V;
                                 if (predicate_both) {
                                     int const offset_g_V = vec * stride_v_V + m * stride_n_V + k * stride_k_V;
                                     int const gmem_idx_V = thread_base_gmem_V + offset_g_V;
