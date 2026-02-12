@@ -366,6 +366,7 @@ struct CollectiveMainloopFwdSm80 {
     >, Element>;
 
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
+    static constexpr int thread_rows = NumMmaThreads / kGmemThreadsPerRow;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
@@ -797,9 +798,18 @@ struct CollectiveMainloopFwdSm80 {
             int const num_m_elements = size<1>(tQgQ);  // e.g., 4  
             int const num_k_elements = size<2>(tQgQ);  // e.g., 8
             // Strides as ints (from layout once); index in loop is manual only
-            int const stride_v = static_cast<int>(tQgQ.layout()(1, 0, 0));
-            int const stride_m = static_cast<int>(tQgQ.layout()(0, 1, 0));
-            int const stride_k = static_cast<int>(tQgQ.layout()(0, 0, 1));
+#if 0
+            int const stride_v_Q = static_cast<int>(tQgQ.layout()(1, 0, 0));
+            int const stride_m_Q = static_cast<int>(tQgQ.layout()(0, 1, 0));
+            int const stride_k_Q = static_cast<int>(tQgQ.layout()(0, 0, 1));
+#else
+            int const q_row_stride = static_cast<int>(get<0>(params.stride_Q));
+            int const stride_m_gmem = thread_rows * q_row_stride;  // = 16 * 256 = 4096
+
+            int const stride_v_Q = 1;
+            int const stride_m_Q = thread_rows * stride_m_gmem;
+            int const stride_k_Q = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
+#endif
             int const stride_sv = static_cast<int>(tQsQ.layout()(1, 0, 0));
             int const stride_sm = static_cast<int>(tQsQ.layout()(0, 1, 0));
             int const stride_sk = static_cast<int>(tQsQ.layout()(0, 0, 1));
@@ -834,7 +844,7 @@ struct CollectiveMainloopFwdSm80 {
                             bool k_is_valid = tQpQ(k);  // Predicate we computed earlier
 
                             if (k_is_valid) {
-                                int const offset_g = vec * stride_v + m * stride_m + k * stride_k;
+                                int const offset_g = vec * stride_v_Q + m * stride_m_Q + k * stride_k_Q;
                                 int const gmem_idx = thread_base_offset + offset_g;
                                 Element value = gmem_tile_base[gmem_idx];
                                 smem_tile_base[smem_idx] = value;
@@ -894,7 +904,8 @@ struct CollectiveMainloopFwdSm80 {
                 // tKgK has shape: (KCPY, KCPY_N, KCPY_K, num_blocks)
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);  // Select pipeline stage
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);          // Select K block
-                Element * smem_tile_base = raw_pointer_cast(sK.data());
+                Element * smem_tile_base_K = raw_pointer_cast(sK.data());
+                Element const * gmem_tile_base_K = raw_pointer_cast(gK.data());
 
                 // Step 2: Calculate the N dimension limit (similar to Q's M limit)
                 // This is more complex than V because it handles the compile-time optimization better
@@ -919,16 +930,26 @@ struct CollectiveMainloopFwdSm80 {
                 int const num_vec_copies = size<0>(tKgK_cur);
                 int const num_n_elements = size<1>(tKgK_cur);
                 int const num_k_elements = size<2>(tKgK_cur);
-                int const thread_rows_K = NumMmaThreads / kGmemThreadsPerRow;
-                int const num_n_per_thread = kBlockN / thread_rows_K;
+                #if 0
+                int const stride_v_K = static_cast<int>(tKgK.layout()(1, 0, 0, 0));
+                int const stride_m_K = static_cast<int>(tKgK.layout()(0, 1, 0, 0));
+                int const stride_k_K = static_cast<int>(tKgK.layout()(0, 0, 1, 0));
+                #else
+                int const k_row_stride = static_cast<int>(get<0>(params.stride_K));  // from params
+
+                int const stride_v_K  = 1;
+                int const stride_m_K  = thread_rows * k_row_stride;
+                // stride_k_gmem only matters if num_k_elements > 1:
+                int const stride_k_K  = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
+                #endif
+                int const num_n_per_thread = kBlockN / thread_rows;
                 int const stride_sv = 1;
                 int const stride_sk = kGmemThreadsPerRow * num_n_per_thread;
-                //int const stride_stage = (kBlockN * kHeadDim) / NumMmaThreads;
-                //int const thread_base_offset_K = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow + (thread_idx % kGmemThreadsPerRow) * kGmemThreadsPerRow;
+                int const thread_base_offset_K = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow + (thread_idx % kGmemThreadsPerRow) * kGmemThreadsPerRow;
 
                 if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
                 {
-					printf("stride_sv=%d, stride_sm=%d, stride_sk=%d\n", stride_sv, stride_sm, stride_sk);
+					printf("stride_v_K=%d, stride_m_K=%d, stride_k_K=%d\n", stride_v_K, stride_m_K, stride_k_K);
                 }
 
                 // Step 5: Triple nested loop with bounds checking
@@ -964,14 +985,18 @@ struct CollectiveMainloopFwdSm80 {
                                 bool k_is_valid = tKVpKV(k);  // Pre-computed K predicate
                                 
                                 if (k_is_valid) {
+                                    // Write to shared memory
+#if 0
                                     // Both N and K are valid - do the actual copy
                                     // Load from global memory (128-bit vectorized)
                                     Element value = tKgK_cur(vec, n, k);
-
-                                    // Write to shared memory
-                                    //tKsK_cur(vec, n, k) = value;
-                                    smem_tile_base[smem_idx] = value;
-                                    
+                                    tKsK_cur(vec, n, k) = value;
+#else
+                                    int const offset_g = vec * stride_v_K + n * stride_m_K + k * stride_k_K;
+                                    int const gmem_idx = thread_base_offset_K + offset_g;
+                                    Element value = gmem_tile_base_K[gmem_idx];
+                                    smem_tile_base_K[smem_idx] = value;
+#endif
                                 } else {
                                     // K is out of bounds - write zero to shared memory
                                     // This prevents garbage from affecting Q×K^T computation
