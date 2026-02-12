@@ -19,6 +19,8 @@
 #include "rotary.h"
 #include "utils.h"
 
+#define FLASH_USE_CUTLASS_TENSOR 0
+
 namespace flash {
 
 using namespace cute;
@@ -810,9 +812,9 @@ struct CollectiveMainloopFwdSm80 {
             int const stride_m_Q = thread_rows * stride_m_gmem;
             int const stride_k_Q = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
 #endif
-            int const stride_sv = static_cast<int>(tQsQ.layout()(1, 0, 0));
-            int const stride_sm = static_cast<int>(tQsQ.layout()(0, 1, 0));
-            int const stride_sk = static_cast<int>(tQsQ.layout()(0, 0, 1));
+            int const stride_sv_Q = static_cast<int>(tQsQ.layout()(1, 0, 0));
+            int const stride_sm_Q = static_cast<int>(tQsQ.layout()(0, 1, 0));
+            int const stride_sk_Q = static_cast<int>(tQsQ.layout()(0, 0, 1));
             // Partition follows GmemLayoutAtom: (NumMmaThreads/kGmemThreadsPerRow, kGmemThreadsPerRow) with stride (kGmemThreadsPerRow, 1).
             // Thread base = (thread_row)*row_stride + (thread_col)*threads_along_k; row_stride = (kHeadDim/2)*kGmemThreadsPerRow (smem layout).
             int const threads_along_k = kGmemThreadsPerRow;
@@ -837,7 +839,7 @@ struct CollectiveMainloopFwdSm80 {
                         
                         #pragma unroll
                         for (int k = 0; k < num_k_elements; ++k) {
-                            int const offset_s = vec * stride_sv + m * stride_sm + k * stride_sk;
+                            int const offset_s = vec * stride_sv_Q + m * stride_sm_Q + k * stride_sk_Q;
                             int const smem_idx = thread_idx * threads_along_k + offset_s;
 
                             // Check if this K coordinate is within valid head dimension
@@ -943,14 +945,10 @@ struct CollectiveMainloopFwdSm80 {
                 int const stride_k_K  = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
                 #endif
                 int const num_n_per_thread = kBlockN / thread_rows;
-                int const stride_sv = 1;
-                int const stride_sk = kGmemThreadsPerRow * num_n_per_thread;
+                int const stride_sv_K = 1;
+                int const stride_sn_K = kGmemThreadsPerRow;
+                int const stride_sk_K = kGmemThreadsPerRow * num_n_per_thread;
                 int const thread_base_offset_K = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow + (thread_idx % kGmemThreadsPerRow) * kGmemThreadsPerRow;
-
-                if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
-                {
-					printf("stride_v_K=%d, stride_m_K=%d, stride_k_K=%d\n", stride_v_K, stride_m_K, stride_k_K);
-                }
 
                 // Step 5: Triple nested loop with bounds checking
                 #pragma unroll
@@ -978,7 +976,7 @@ struct CollectiveMainloopFwdSm80 {
                             
                             #pragma unroll
                             for (int k = 0; k < num_k_elements; ++k) {
-                                int const offset_s = vec * stride_sv + n * stride_sm + k * stride_sk;
+                                int const offset_s = vec * stride_sv_K + n * stride_sn_K + k * stride_sk_K;
                                 int const smem_idx = thread_idx * threads_along_k + offset_s;
                                 
                                 // Check if this K coordinate is within valid head dimension
@@ -1050,76 +1048,88 @@ struct CollectiveMainloopFwdSm80 {
                 // ============================================================================
 
                 // Step 1: Extract current V tile for this n_block and pipeline stage
-                // tVsV has shape: (VCOPY, MMA_N, MMA_K, kStages)
-                // tVgV has shape: (VCOPY, MMA_N, MMA_K, num_blocks)
-                Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_write);  // Select pipeline stage
-                Tensor tVgV_cur = tVgV(_, _, _, n_block);          // Select K/V block
+                Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_write);
+                Tensor tVgV_cur = tVgV(_, _, _, n_block);
 
-                // Step 2: Calculate how many valid rows in this K block
-                // Similar to Q, but for the K/V sequence dimension
+                // Step 2: Calculate how many valid rows in this V block
                 int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
 
-                // Step 3: Get tensor dimensions
-                int const num_vec_copies = size<0>(tVsV_cur);  // e.g., 2
-                int const num_n_elements = size<1>(tVsV_cur);  // e.g., 4 (N dimension)
-                int const num_k_elements = size<2>(tVsV_cur);  // e.g., 8 (K dimension)
+                // Step 3: Dimensions (same partition as K: same GmemTiledCopyQKV, same tile shape)
+                int const num_vec_copies = size<0>(tVsV_cur);
+                int const num_n_elements = size<1>(tVsV_cur);
+                int const num_k_elements = size<2>(tVsV_cur);
 
-                // Step 4: Nested loops with TWO levels of predicates
+#if !FLASH_USE_CUTLASS_TENSOR
+                // Manual address calculation for V (no cutlass tensor indexing)
+                int const v_row_stride = static_cast<int>(get<0>(params.stride_V));
+                // gmem partition strides: vec is contiguous, n jumps thread_rows gmem rows
+                int const stride_v_V   = 1;
+                int const stride_n_V   = thread_rows * v_row_stride;
+                int const stride_k_V   = kBlockKGmem;
+                // gmem thread base: (thread_row * row_stride_gmem) + (thread_col * kGmemElemsPerLoad)
+                int const thread_base_gmem_V = (thread_idx / kGmemThreadsPerRow) * v_row_stride
+                                             + (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad;
+                // smem partition strides: same atom (8, kBlockKGmem) tiled to (kBlockN, kHeadDim, kStages)
+                // stride_sv = 1 (vec contiguous), stride_sn = thread_rows * kBlockKGmem (jump thread_rows rows in smem atom)
+                // stride_stage = kBlockN * kHeadDim (total elements per stage tile)
+                int const stride_sv_V    = 1;
+                int const stride_sn_V    = thread_rows * kBlockKGmem;
+                int const stride_sk_V    = kBlockKGmem * kBlockN;  // only matters if num_k > 1
+                int const stride_stage_V = kBlockN * kHeadDim;
+                // smem thread base: same 2D pattern as Q (from the log)
+                int const thread_base_smem_V = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow
+                                             + (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad;
+                Element const* gmem_tile_base_V = raw_pointer_cast(gV(_, _, n_block).data());
+                Element* smem_tile_base_V = raw_pointer_cast(sV.data());
+#endif
+
+                // Step 4: Nested loops with two levels of predicates
                 #pragma unroll
                 for (int m = 0; m < num_n_elements; ++m) {
-                    
-                    // First predicate: Check if this N row is within tile bounds (kBlockN)
-                    // This is for when kBlockN doesn't evenly divide into the thread layout
+
+                    // First predicate: is this N row within the tile bounds (kBlockN)?
                     bool row_within_tile;
                     if (EvenN) {
-                        // If kBlockN is evenly divisible, all rows are within tile
                         row_within_tile = true;
                     } else {
-                        // Check if this is the last row OR if it's within kBlockN
-                        row_within_tile = (m < num_n_elements - 1) || 
+                        row_within_tile = (m < num_n_elements - 1) ||
                                         (get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN);
                     }
-                    
+
                     if (row_within_tile) {
-                        // Second predicate: Check if this N row is within sequence bounds
-                        int n_coord = get<0>(t0KVcKV(_0{}, m, _0{}));  // Global N coordinate
-                        bool row_within_sequence;
-                        
-                        if (Seqlenk_mask) {
-                            // Need to check sequence bounds (last K block might be partial)
-                            row_within_sequence = (n_coord < seqlenk_row_limit);
-                        } else {
-                            // No masking needed (not the last block, or even division)
-                            row_within_sequence = true;
-                        }
-                        
-                        // Combined N predicate
-                        bool const predicate_n = row_within_sequence;
-                        
-                        // Now loop over K dimension
+                        // Second predicate: is this N row within sequence bounds?
+                        int n_coord = get<0>(t0KVcKV(_0{}, m, _0{}));
+                        bool const predicate_n = !Seqlenk_mask || (n_coord < seqlenk_row_limit);
+
                         #pragma unroll
                         for (int k = 0; k < num_k_elements; ++k) {
-                            
-                            // K predicate (head dimension bounds)
-                            bool const predicate_k = tKVpKV(k);  // Pre-computed K validity
-                            
-                            // Combined predicate: both N and K must be valid
+                            bool const predicate_k = tKVpKV(k);
                             bool const predicate_both = predicate_k && predicate_n;
-                            
-                            // Now copy each vectorized element
+
+                            #pragma unroll
                             for (int vec = 0; vec < num_vec_copies; ++vec) {
+#if FLASH_USE_CUTLASS_TENSOR
                                 if (predicate_both) {
-                                    // Both N and K valid: Copy data
-                                    Element value = tVgV_cur(vec, m, k);  // Read from global memory
-                                    tVsV_cur(vec, m, k) = value;          // Write to shared memory
+                                    Element value = tVgV_cur(vec, m, k);
+                                    tVsV_cur(vec, m, k) = value;
                                 } else {
-                                    // Either N or K invalid: Zero (prevents garbage in MMA)
                                     tVsV_cur(vec, m, k) = Element(0);
                                 }
+#else
+                                int const offset_s_V = vec * stride_sv_V + m * stride_sn_V + k * stride_sk_V;
+                                int const smem_idx_V = thread_base_smem_V + smem_pipe_write * stride_stage_V + offset_s_V;
+                                if (predicate_both) {
+                                    int const offset_g_V = vec * stride_v_V + m * stride_n_V + k * stride_k_V;
+                                    int const gmem_idx_V = thread_base_gmem_V + offset_g_V;
+                                    Element value = gmem_tile_base_V[gmem_idx_V];
+                                    smem_tile_base_V[smem_idx_V] = value;
+                                } else {
+                                    smem_tile_base_V[smem_idx_V] = Element(0);
+                                }
+#endif
                             }
                         }
                     }
-                    // If !row_within_tile, skip this row entirely (out of tile bounds)
                 }
                 #endif
             //} else {
