@@ -1526,7 +1526,13 @@ struct CollectiveMainloopFwdSm80 {
                     // cute::gemm(tiled_mma, A, B, C) with A(V,M,K), B(V,N,K), C(V,M,N) does: for k, then for m,n serpentine, call mma(D, A(_,m,k), B(_,n,k), C).
                     // Here we have a single k slice (k_block), so one (V,M) x (V,N) => (V,M,N) with row-major serpentine over (m,n).
                     {
+                        // M = number of MMA-atom steps in the M direction for this warp.
+                        // tSrQ_cur is (V, M, K): dim 1 = MmaTileM / (atom_M * kNWarps).
+                        // MmaTileM = 16*kNWarps = 64, atom_M = 16, kNWarps = 4: M = 64/(16*4) = 1.
                         int const M = size<1>(tSrQ_cur);
+                        // N = number of MMA-atom steps in the N direction.
+                        // tSrK is (V, N, K): dim 1 = MmaTileN / atom_N.
+                        // MmaTileN = 16 (from TiledMma Tile<..., _16, ...>), atom_N = 8: N = 16/8 = 2.
                         int const N = size<1>(tSrK);
                         #pragma unroll
                         for (int m = 0; m < M; ++m) {
