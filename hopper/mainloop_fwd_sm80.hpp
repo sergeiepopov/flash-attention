@@ -4,12 +4,14 @@
 
 #pragma once
 
+#include <type_traits>
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 
 #include "cute/tensor.hpp"
+#include "cute/arch/util.hpp"  // cute::detail::explode for FLASH_RAW_MMA
 
 #include "seqlen.h"
 #include "block.h"
@@ -20,6 +22,8 @@
 #include "utils.h"
 
 #define FLASH_USE_CUTLASS_TENSOR 0
+#define FLASH_MANUAL_GEMM
+#define FLASH_RAW_MMA
 
 namespace flash {
 
@@ -1517,8 +1521,52 @@ struct CollectiveMainloopFwdSm80 {
                     //    printf("====================================\n\n");
                     //}
                     
+#ifdef FLASH_MANUAL_GEMM
+                    // Manual GEMM: same instruction as cute::gemm (mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 or m16n8k8).
+                    // cute::gemm(tiled_mma, A, B, C) with A(V,M,K), B(V,N,K), C(V,M,N) does: for k, then for m,n serpentine, call mma(D, A(_,m,k), B(_,n,k), C).
+                    // Here we have a single k slice (k_block), so one (V,M) x (V,N) => (V,M,N) with row-major serpentine over (m,n).
+                    {
+                        int const M = size<1>(tSrQ_cur);
+                        int const N = size<1>(tSrK);
+                        #pragma unroll
+                        for (int m = 0; m < M; ++m) {
+                            #pragma unroll
+                            for (int n = 0; n < N; ++n) {
+                                int const ns = (m & 1) ? (N - 1 - n) : n;  // serpentine
+#ifdef FLASH_RAW_MMA
+                                // Expand tiled_mma.call to the actual PTX: recast fragments to register arrays, then call MMA_Op::fma (mma.sync.aligned.m16n8k*...).
+                                // Same as cute::mma_unpack(traits, D, A, B, C): recast D,A,B,C to DRegisters/ARegisters/BRegisters/CRegisters, then explode into fma(...).
+                                using MMA_Op = typename TiledMma::Atom::MMA_Op;
+                                using RegTypeD = typename std::remove_extent<typename MMA_Op::DRegisters>::type;
+                                using RegTypeA = typename std::remove_extent<typename MMA_Op::ARegisters>::type;
+                                using RegTypeB = typename std::remove_extent<typename MMA_Op::BRegisters>::type;
+                                using RegTypeC = typename std::remove_extent<typename MMA_Op::CRegisters>::type;
+                                constexpr int RegNumD = std::extent<typename MMA_Op::DRegisters>::value;
+                                constexpr int RegNumA = std::extent<typename MMA_Op::ARegisters>::value;
+                                constexpr int RegNumB = std::extent<typename MMA_Op::BRegisters>::value;
+                                constexpr int RegNumC = std::extent<typename MMA_Op::CRegisters>::value;
+                                auto D_slice = tSrS(_, m, ns);
+                                auto A_slice = tSrQ_cur(_, m, k_block);
+                                auto B_slice = tSrK(_, ns, k_block);
+                                auto C_slice = tSrS(_, m, ns);
+                                auto rD = recast<RegTypeD>(D_slice);
+                                auto rA = recast<RegTypeA>(A_slice);
+                                auto rB = recast<RegTypeB>(B_slice);
+                                auto rC = recast<RegTypeC>(C_slice);
+                                cute::detail::explode(MMA_Op::fma,
+                                    rD, cute::make_int_sequence<RegNumD>{},
+                                    rA, cute::make_int_sequence<RegNumA>{},
+                                    rB, cute::make_int_sequence<RegNumB>{},
+                                    rC, cute::make_int_sequence<RegNumC>{});
+#else
+                                tiled_mma.call(tSrS(_, m, ns), tSrQ_cur(_, m, k_block), tSrK(_, ns, k_block), tSrS(_, m, ns));
+#endif
+                            }
+                        }
+                    }
+#else
                     cute::gemm(tiled_mma, tSrQ_cur(_, _, k_block), tSrK(_, _, k_block), tSrS);
-                    
+#endif
                     // After this instruction, tSrS accumulates: S += Q_k × K_k^T
                     // The accumulator is in fp32 for numerical precision
                 }
