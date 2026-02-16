@@ -2031,8 +2031,38 @@ struct CollectiveMainloopFwdSm80 {
         auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
             static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
             static constexpr bool Check_inf = decltype(check_inf_type)::value;
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
+#else
+            // S accumulator: raw float array backing the MMA D/C registers.
+            // A CuTe tensor view is created over this array for mask/softmax/P-conversion
+            // (which require the CuTe tensor interface); the MMA D/C access uses RawRegs.
+            //
+            // S is the C/D accumulator of Q×K^T: shape (kBlockM, kBlockN).
+            // Per thread: VRegsPerAtomS floats × NAtomsM_S × NAtomsN_S atoms.
+            //
+            // partition_fragment_C uses make_layout(shape) which produces LayoutLeft
+            // (column-major) strides: first mode varies fastest.
+            // For shape (V=4, M=NAtomsM_S, N=NAtomsN_S):
+            //   stride_V = 1,  stride_M = 4,  stride_N = 4 * NAtomsM_S
+            // => M is inner, N is outer.
+            //
+            // Flat index: S_regs[m * 4 + ns * 4 * NAtomsM_S + v]
+            //   m  = MMA atom index in M per warp (0..NAtomsM_S-1)
+            //   ns = MMA atom index in N (0..NAtomsN_S-1)
+            //   v  = float sub-register (0..3)
+            static constexpr int VRegsPerAtomS = 4;                      // float[4] per C/D atom (SM75 & SM80)
+            static constexpr int NAtomsM_S = kBlockM / (16 * kNWarps);   // M-atoms per warp (atom_M=16)
+            static constexpr int NAtomsN_S = kBlockN / 8;                // N-atoms (atom_N=8)
+            static constexpr int TotalSRegs = NAtomsM_S * NAtomsN_S * VRegsPerAtomS;
+            float S_regs[TotalSRegs];
+            // CuTe tensor view over S_regs with LayoutLeft layout from partition_fragment_C.
+            // Used by mask/softmax/P-conversion functions that require CuTe tensor interface.
+            auto tSrS = make_tensor(static_cast<float*>(S_regs),
+                partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{})).layout());
+            clear(tSrS);
+#endif
             sync();
             auto load_V_next = [&] {
                 if (n_block - kStages + 1 >= n_block_min) {
@@ -2409,25 +2439,30 @@ struct CollectiveMainloopFwdSm80 {
                                 constexpr int RegNumA = std::extent<typename MMA_Op::ARegisters>::value;
                                 constexpr int RegNumB = std::extent<typename MMA_Op::BRegisters>::value;
                                 constexpr int RegNumC = std::extent<typename MMA_Op::CRegisters>::value;
+#if FLASH_USE_CUTLASS_TENSOR
                                 auto D_slice = tSrS(_, m, ns);
                                 auto C_slice = tSrS(_, m, ns);
                                 auto rD = recast<RegTypeD>(D_slice);
-#if FLASH_USE_CUTLASS_TENSOR
+                                auto rC = recast<RegTypeC>(C_slice);
                                 auto A_slice = tSrQ_cur(_, m, k_block);
                                 auto rA = recast<RegTypeA>(A_slice);
                                 auto B_slice = tSrK(_, ns, k_block);
                                 auto rB = recast<RegTypeB>(B_slice);
 #else
-                                // Raw Q register access: index into flat array.
-                                // For SM75: RegNumA=2 → 2 uint32 per atom at Q_regs[k*RegsPerKBlockQ + m*2 + {0,1}]
-                                // For SM80: RegNumA=4 → 4 uint32 per atom at Q_regs[k*RegsPerKBlockQ + m*4 + {0,1,2,3}]
+                                // Raw S accumulator D/C: LayoutLeft (M-inner, N-outer).
+                                // D (output) and C (input) point to the same location (in-place accumulation).
+                                // Offset = m * 4 + ns * 4 * NAtomsM_S  (stride_M=4, stride_N=4*NAtomsM_S).
+                                flash::RawRegs<RegTypeD, RegNumD> rD{
+                                    &S_regs[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_S]};
+                                flash::RawRegs<RegTypeC, RegNumC> rC{
+                                    &S_regs[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_S]};
+                                // Raw Q register access.
                                 flash::RawRegs<RegTypeA, RegNumA> rA{reinterpret_cast<RegTypeA*>(
                                     &Q_regs[k_block * RegsPerKBlockQ + m * VRegsPerAtomQ])};
                                 // Raw K register access.
                                 flash::RawRegs<RegTypeB, RegNumB> rB{reinterpret_cast<RegTypeB*>(
                                     &K_regs[k_block * RegsPerKBlock + ns * VRegsPerAtomK])};
 #endif
-                                auto rC = recast<RegTypeC>(C_slice);
                                 cute::detail::explode(MMA_Op::fma,
                                     rD, cute::make_int_sequence<RegNumD>{},
                                     rA, cute::make_int_sequence<RegNumA>{},
