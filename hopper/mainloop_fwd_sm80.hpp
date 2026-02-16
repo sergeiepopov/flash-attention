@@ -507,6 +507,137 @@ CUTLASS_DEVICE void copy_K_smem_to_regs_manual_x2(
 }
 
 // ============================================================================
+// MANUAL ADDRESS CALCULATION: smem→register TRANSPOSED copy for V matrix
+// ============================================================================
+//
+// V is the B-operand of the P×V GEMM.  V is stored in smem in the SAME physical
+// layout as K — (kBlockN, kHeadDim) row-major — but accessed through a transposed
+// view sVt with logical shape (kHeadDim, kBlockN).  The ldmatrix.trans instruction
+// loads rows from the physical layout and transposes each 8×8 sub-matrix on the fly.
+//
+// This SWAPS the role of row/col in the sub-matrix mapping vs. non-transposed:
+//
+//   NON-TRANSPOSED (Q, K):                    TRANSPOSED (V):
+//     sub-matrix selects ROW blocks             sub-matrix selects COLUMN blocks
+//     all sub-matrices share same cols          all sub-matrices share same rows
+//
+//   Physical smem_V layout: (kBlockN, kHeadDim), stride (kHeadDim, 1)
+//
+//   SM75 (x2.trans):
+//     Loads 8 token-rows × 16 headdim-cols (2 col-adjacent 8×8 sub-matrices).
+//     After transpose: 16 headdim × 8 tokens = (MmaTileN, MmaTileK) = (16, 8).
+//       smem_row = k_block * 8 + lane_id % 8
+//       smem_col = n * 16 + ((lane_id/8) % 2) * 8
+//
+//   SM80 (x4.trans):
+//     Loads 16 token-rows × 16 headdim-cols (2×2 grid of 8×8 sub-matrices).
+//     After transpose: 16 headdim × 16 tokens = (MmaTileN, MmaTileK) = (16, 16).
+//       group = lane_id / 8
+//       smem_row = k_block * 16 + (group / 2) * 8 + lane_id % 8
+//       smem_col = n * 16 + (group % 2) * 8
+//
+//   smem address = smem_V_base + smem_row * kHeadDim + smem_col
+//
+// ============================================================================
+
+// SM80 variant (ldmatrix.x4.trans): loads+transposes a 16×16 block.
+template<int kHeadDim_, int kBlockN_, typename Element_, typename TensorD>
+CUTLASS_DEVICE void copy_V_smem_to_regs_manual_transposed(
+    Element_ const* smem_V_base,
+    int thread_idx,
+    int k_block,
+    TensorD& dst)
+{
+    // K-dim of SM80 MMA atom mma.sync.aligned.m16n8k16 (PTX ISA).
+    static constexpr int MmaTileK = 16;
+    // ldmatrix.x4.trans loads a 2×2 grid of m8n8 sub-matrices (16 rows × 16 cols
+    // in physical smem) and transposes each 8×8 independently.
+    static constexpr int NPerLdmatrix = 16;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+    // 4 groups of 8 lanes (PTX ISA: each group addresses one 8×8 sub-matrix).
+    int const group = lane_id / 8;
+    int const row_in_group = lane_id % 8;
+
+    // TRANSPOSED mapping (group / 2 selects token-ROW block, group % 2 selects
+    // headdim-COLUMN block — swapped vs. non-transposed Q/K):
+    //   group 0 → token rows 0-7,  headdim cols 0-7
+    //   group 1 → token rows 0-7,  headdim cols 8-15
+    //   group 2 → token rows 8-15, headdim cols 0-7
+    //   group 3 → token rows 8-15, headdim cols 8-15
+    int const row_offset = (group / 2) * 8 + row_in_group;   // token rows
+    int const col_offset = (group % 2) * 8;                   // headdim cols
+
+    Tensor dst_u32 = recast<uint32_t>(dst);
+
+    #pragma unroll
+    for (int n = 0; n < size<1>(dst_u32); ++n) {
+        int const smem_row = k_block * MmaTileK + row_offset;
+        int const smem_col = n * NPerLdmatrix + col_offset;
+
+        Element_ const* addr = smem_V_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t& r0 = dst_u32(_0{}, n);
+        uint32_t& r1 = dst_u32(_1{}, n);
+        uint32_t& r2 = dst_u32(_2{}, n);
+        uint32_t& r3 = dst_u32(_3{}, n);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// SM75 variant (ldmatrix.x2.trans): loads+transposes a 8×16 block.
+template<int kHeadDim_, int kBlockN_, typename Element_, typename TensorD>
+CUTLASS_DEVICE void copy_V_smem_to_regs_manual_transposed_x2(
+    Element_ const* smem_V_base,
+    int thread_idx,
+    int k_block,
+    TensorD& dst)
+{
+    // K-dim of SM75 MMA atom mma.sync.aligned.m16n8k8 (PTX ISA).
+    static constexpr int MmaTileK = 8;
+    // ldmatrix.x2.trans loads 2 column-adjacent m8n8 sub-matrices (8 rows × 16 cols
+    // in physical smem) and transposes each 8×8.
+    static constexpr int NPerLdmatrix = 16;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+
+    // TRANSPOSED mapping (sub_matrix selects headdim-COLUMN block, not row block):
+    //   groups 0,2 → headdim cols 0-7    (sub_matrix 0)
+    //   groups 1,3 → headdim cols 8-15   (sub_matrix 1)
+    // All sub-matrices share the same 8 token rows.
+    int const sub_matrix = (lane_id / 8) % 2;  // selects headdim column block
+    int const row_in_sub = lane_id % 8;         // 0..7 → token row within the block
+
+    Tensor dst_u32 = recast<uint32_t>(dst);
+
+    #pragma unroll
+    for (int n = 0; n < size<1>(dst_u32); ++n) {
+        int const smem_row = k_block * MmaTileK + row_in_sub;
+        int const smem_col = n * NPerLdmatrix + sub_matrix * 8;
+
+        Element_ const* addr = smem_V_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t& r0 = dst_u32(_0{}, n);
+        uint32_t& r1 = dst_u32(_1{}, n);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
 // HOW cute::copy ORCHESTRATES THIS
 // ============================================================================
 //
@@ -930,7 +1061,11 @@ struct CollectiveMainloopFwdSm80 {
 #else
         Element const* smem_K_ptr = raw_pointer_cast(sK.data());
 #endif
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+#else
+        Element const* smem_V_ptr = raw_pointer_cast(sV.data());
+#endif
 
         // Predicates
         Tensor cKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));
@@ -1941,7 +2076,13 @@ struct CollectiveMainloopFwdSm80 {
             // ============================================================================
             {
                 // Get the current V tile from shared memory
+#if FLASH_USE_CUTLASS_TENSOR
                 auto tCsV_cur = tOsVt(_, _, _, /*kStages > 1 ? smem_pipe_read : */0);
+#else
+                // V stage is currently hardcoded to 0 (pipeline staging commented out).
+                // Physical layout: (kBlockN, kHeadDim) row-major per stage.
+                Element const* smem_V_stage_ptr = smem_V_ptr /* + stage * kBlockN * kHeadDim */;
+#endif
                 
                 // Create retiled view for V that matches ldmatrix register layout
                 Tensor tCrV_copy_view = smem_thr_copy_V.retile_D(tOrV);
@@ -1965,6 +2106,7 @@ struct CollectiveMainloopFwdSm80 {
                 //   Col 1: [v01 v11 v21 ... v71]            Thread 1: gets v10,v11 from row 1
                 //   ...                                     ...
                 //
+#if FLASH_USE_CUTLASS_TENSOR
                 if constexpr (UseSM80MMA) {
                     flash::educational_copy_smem_to_regs_transposed(
                         smem_tiled_copy_V, tCsV_cur(_, _, _0{}), tCrV_copy_view(_, _, _0{}));
@@ -1972,6 +2114,15 @@ struct CollectiveMainloopFwdSm80 {
                     flash::educational_copy_smem_to_regs_transposed_x2(
                         smem_tiled_copy_V, tCsV_cur(_, _, _0{}), tCrV_copy_view(_, _, _0{}));
                 }
+#else
+                if constexpr (UseSM80MMA) {
+                    flash::copy_V_smem_to_regs_manual_transposed<kHeadDim, kBlockN>(
+                        smem_V_stage_ptr, thread_idx, 0, tCrV_copy_view(_, _, _0{}));
+                } else {
+                    flash::copy_V_smem_to_regs_manual_transposed_x2<kHeadDim, kBlockN>(
+                        smem_V_stage_ptr, thread_idx, 0, tCrV_copy_view(_, _, _0{}));
+                }
+#endif
                 
                 // ========================================================================
                 // PHASE 2: Main K-dimension loop (P × V accumulation)
@@ -1984,6 +2135,7 @@ struct CollectiveMainloopFwdSm80 {
                     // PREFETCH: Load NEXT k-slice of V while current MMA executes
                     // --------------------------------------------------------------------
                     if (k_block < size<2>(tOrP) - 1) {
+#if FLASH_USE_CUTLASS_TENSOR
                         if constexpr (UseSM80MMA) {
                             flash::educational_copy_smem_to_regs_transposed(
                                 smem_tiled_copy_V, tCsV_cur(_, _, k_block + 1), tCrV_copy_view(_, _, k_block + 1));
@@ -1991,6 +2143,15 @@ struct CollectiveMainloopFwdSm80 {
                             flash::educational_copy_smem_to_regs_transposed_x2(
                                 smem_tiled_copy_V, tCsV_cur(_, _, k_block + 1), tCrV_copy_view(_, _, k_block + 1));
                         }
+#else
+                        if constexpr (UseSM80MMA) {
+                            flash::copy_V_smem_to_regs_manual_transposed<kHeadDim, kBlockN>(
+                                smem_V_stage_ptr, thread_idx, k_block + 1, tCrV_copy_view(_, _, k_block + 1));
+                        } else {
+                            flash::copy_V_smem_to_regs_manual_transposed_x2<kHeadDim, kBlockN>(
+                                smem_V_stage_ptr, thread_idx, k_block + 1, tCrV_copy_view(_, _, k_block + 1));
+                        }
+#endif
                     }
                     
                     // --------------------------------------------------------------------
