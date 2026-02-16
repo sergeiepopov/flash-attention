@@ -255,6 +255,258 @@ CUTLASS_DEVICE void educational_copy_smem_to_regs_transposed(
 }
 
 // ============================================================================
+// MANUAL ADDRESS CALCULATION: smem→register copy for Q matrix
+// ============================================================================
+//
+// These functions replace the CuTe shared memory tensor (tSsQ) with manual
+// index calculation for the Q matrix smem→register copy.  The register tensor
+// (tCrQ_copy_view) is kept as a CuTe tensor — only the source smem address is
+// computed by hand.
+//
+// Address derivation (row-major Q in smem, no swizzle):
+//
+//   smem_Q layout: (kBlockM, kHeadDim), stride (kHeadDim, 1)
+//
+//   For a given k_block and MMA-atom repeat m:
+//     atom_row_start = m * MmaTileM + warp_id * 16
+//
+//   Each warp's 32 lanes map to 16 rows of the MMA atom (16 × MmaTileK block):
+//     SM75 (x2, MmaTileK=8):
+//       sub_matrix  = (lane_id / 8) % 2        — 0 = top 8×8, 1 = bottom 8×8
+//       row_in_sub  = lane_id % 8
+//       row_offset  = sub_matrix * 8 + row_in_sub
+//       col         = k_block * 8
+//
+//     SM80 (x4, MmaTileK=16):
+//       group       = lane_id / 8               — 0..3
+//       row_offset  = (group % 2) * 8 + (lane_id % 8)
+//       col         = k_block * 16 + (group / 2) * 8
+//
+//   smem address = smem_Q_base + (atom_row_start + row_offset) * kHeadDim + col
+//
+// ============================================================================
+
+// SM80 variant (ldmatrix.x4): loads 16×16 block as 4 × 8×8 sub-matrices.
+template<int kBlockM_, int kHeadDim_, int kNWarps_, typename Element_, typename TensorD>
+CUTLASS_DEVICE void copy_Q_smem_to_regs_manual(
+    Element_ const* smem_Q_base,
+    int thread_idx,
+    int k_block,
+    TensorD& dst)
+{
+    // K-dim of SM80 MMA atom mma.sync.aligned.m16n8k16 (PTX ISA).
+    static constexpr int MmaTileK = 16;
+    // M-dim of MMA atom (16 rows); all MMA atoms use m16 for fp16/bf16.
+    static constexpr int MmaAtomM = 16;
+    // Total M rows handled by one MMA tile = MmaAtomM * kNWarps (one atom per warp).
+    static constexpr int MmaTileM = 16 * kNWarps_;
+
+    // 32 threads per warp (CUDA warp size).
+    int const warp_id = thread_idx / 32;
+    int const lane_id = thread_idx % 32;
+    // ldmatrix.x4 uses 4 groups of 8 threads; each group provides 8 addresses
+    // for one 8×8 sub-matrix (m8n8 — the fundamental ldmatrix unit, PTX ISA).
+    int const group = lane_id / 8;          // 0..3 → selects which 8×8 sub-matrix
+    int const row_in_group = lane_id % 8;   // 0..7 → row within that 8×8 sub-matrix
+
+    // The 16×16 A-operand is a 2×2 grid of 8×8 sub-matrices (PTX m16n8k16 spec):
+    //   group 0 → (rows 0-7,  cols 0-7)    group 2 → (rows 0-7,  cols 8-15)
+    //   group 1 → (rows 8-15, cols 0-7)    group 3 → (rows 8-15, cols 8-15)
+    // Vertical position: groups 0,2 → top half; groups 1,3 → bottom half.
+    int const row_offset = (group % 2) * 8 + row_in_group;
+    // Horizontal position: groups 0,1 → left k-half; groups 2,3 → right k-half.
+    int const col_offset = (group / 2) * 8;
+
+    Tensor dst_u32 = recast<uint32_t>(dst);
+
+    #pragma unroll
+    for (int m = 0; m < size<1>(dst_u32); ++m) {
+        int const atom_row_start = m * MmaTileM + warp_id * MmaAtomM;
+        int const smem_row = atom_row_start + row_offset;
+        int const smem_col = k_block * MmaTileK + col_offset;
+
+        Element_ const* addr = smem_Q_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t& r0 = dst_u32(_0{}, m);
+        uint32_t& r1 = dst_u32(_1{}, m);
+        uint32_t& r2 = dst_u32(_2{}, m);
+        uint32_t& r3 = dst_u32(_3{}, m);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// SM75 variant (ldmatrix.x2): loads 16×8 block as 2 × 8×8 sub-matrices.
+template<int kBlockM_, int kHeadDim_, int kNWarps_, typename Element_, typename TensorD>
+CUTLASS_DEVICE void copy_Q_smem_to_regs_manual_x2(
+    Element_ const* smem_Q_base,
+    int thread_idx,
+    int k_block,
+    TensorD& dst)
+{
+    // K-dim of SM75 MMA atom mma.sync.aligned.m16n8k8 (PTX ISA).
+    static constexpr int MmaTileK = 8;
+    // M-dim of MMA atom (16 rows); all MMA atoms use m16 for fp16/bf16.
+    static constexpr int MmaAtomM = 16;
+    // Total M rows handled by one MMA tile = MmaAtomM * kNWarps (one atom per warp).
+    static constexpr int MmaTileM = 16 * kNWarps_;
+
+    // 32 threads per warp (CUDA warp size).
+    int const warp_id = thread_idx / 32;
+    int const lane_id = thread_idx % 32;
+
+    // ldmatrix.x2 loads 2 × m8n8 sub-matrices (PTX ISA), stacked vertically
+    // in a 16-row × 8-col block.  The 32 lanes divide into 4 groups of 8;
+    // only 2 groups contribute unique addresses (groups 2,3 mirror groups 0,1).
+    //   groups 0,2 → sub-matrix 0 (rows 0-7)
+    //   groups 1,3 → sub-matrix 1 (rows 8-15)
+    int const sub_matrix = (lane_id / 8) % 2;  // 0 = top 8×8, 1 = bottom 8×8
+    int const row_in_sub = lane_id % 8;         // 0..7 → row within that 8×8
+    int const row_offset = sub_matrix * 8 + row_in_sub;
+
+    Tensor dst_u32 = recast<uint32_t>(dst);
+
+    #pragma unroll
+    for (int m = 0; m < size<1>(dst_u32); ++m) {
+        int const atom_row_start = m * MmaTileM + warp_id * MmaAtomM;
+        int const smem_row = atom_row_start + row_offset;
+        int const smem_col = k_block * MmaTileK;
+
+        Element_ const* addr = smem_Q_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t& r0 = dst_u32(_0{}, m);
+        uint32_t& r1 = dst_u32(_1{}, m);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
+// MANUAL ADDRESS CALCULATION: smem→register copy for K matrix (B-operand)
+// ============================================================================
+//
+// K is the B-operand of the MMA.  All warps share the same K data (warps are
+// distributed along M, not N), so there is no warp-based row offset.
+//
+//   smem_K layout per stage: (kBlockN, kHeadDim), stride (kHeadDim, 1)
+//
+//   For a given k_block and ldmatrix repeat n:
+//     base_n_row = n * 16
+//
+//   Thread address within the 16-row block is identical to Q:
+//     SM75 (x2):  row_offset = ((lane_id/8)%2)*8 + lane_id%8
+//                 col = k_block * 8
+//     SM80 (x4):  row_offset = ((lane_id/8)%2)*8 + lane_id%8
+//                 col = k_block * 16 + (lane_id/8/2)*8
+//
+//   smem address = smem_K_stage_base + (base_n_row + row_offset) * kHeadDim + col
+//
+// The caller must pass a base pointer already adjusted for the pipeline stage:
+//   smem_K_stage_base = smem_K_ptr + stage * kBlockN * kHeadDim
+//
+// ============================================================================
+
+// SM80 variant (ldmatrix.x4): loads 16×16 block as 4 × 8×8 sub-matrices.
+template<int kHeadDim_, typename Element_, typename TensorD>
+CUTLASS_DEVICE void copy_K_smem_to_regs_manual(
+    Element_ const* smem_K_stage_base,
+    int thread_idx,
+    int k_block,
+    TensorD& dst)
+{
+    // K-dim of SM80 MMA atom mma.sync.aligned.m16n8k16 (PTX ISA).
+    static constexpr int MmaTileK = 16;
+    // ldmatrix.x4 loads 4 × m8n8 sub-matrices arranged as a 2×2 grid, covering
+    // 16 rows (2 vertical × 8) × 16 cols (2 horizontal × 8).  One call therefore
+    // advances 16 rows in the N dimension of K.
+    static constexpr int NPerLdmatrix = 16;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+    // 4 groups of 8 lanes; each group addresses one 8×8 sub-matrix (PTX ISA).
+    int const group = lane_id / 8;          // 0..3
+    int const row_in_group = lane_id % 8;   // 0..7
+
+    // Same 2×2 sub-matrix layout as the Q x4 variant (see comments there).
+    int const row_offset = (group % 2) * 8 + row_in_group;
+    int const col_offset = (group / 2) * 8;
+
+    Tensor dst_u32 = recast<uint32_t>(dst);
+
+    #pragma unroll
+    for (int n = 0; n < size<1>(dst_u32); ++n) {
+        int const smem_row = n * NPerLdmatrix + row_offset;
+        int const smem_col = k_block * MmaTileK + col_offset;
+
+        Element_ const* addr = smem_K_stage_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t& r0 = dst_u32(_0{}, n);
+        uint32_t& r1 = dst_u32(_1{}, n);
+        uint32_t& r2 = dst_u32(_2{}, n);
+        uint32_t& r3 = dst_u32(_3{}, n);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// SM75 variant (ldmatrix.x2): loads 16×8 block as 2 × 8×8 sub-matrices.
+template<int kHeadDim_, typename Element_, typename TensorD>
+CUTLASS_DEVICE void copy_K_smem_to_regs_manual_x2(
+    Element_ const* smem_K_stage_base,
+    int thread_idx,
+    int k_block,
+    TensorD& dst)
+{
+    // K-dim of SM75 MMA atom mma.sync.aligned.m16n8k8 (PTX ISA).
+    static constexpr int MmaTileK = 8;
+    // ldmatrix.x2 loads 2 × m8n8 sub-matrices stacked vertically, covering
+    // 16 rows (2 × 8) × 8 cols.  One call advances 16 N-rows of K.
+    static constexpr int NPerLdmatrix = 16;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+    // Same vertical sub-matrix mapping as the Q x2 variant (see comments there).
+    int const sub_matrix = (lane_id / 8) % 2;  // 0 = top 8×8, 1 = bottom 8×8
+    int const row_in_sub = lane_id % 8;         // 0..7 → row within that 8×8
+    int const row_offset = sub_matrix * 8 + row_in_sub;
+
+    Tensor dst_u32 = recast<uint32_t>(dst);
+
+    #pragma unroll
+    for (int n = 0; n < size<1>(dst_u32); ++n) {
+        int const smem_row = n * NPerLdmatrix + row_offset;
+        int const smem_col = k_block * MmaTileK;
+
+        Element_ const* addr = smem_K_stage_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t& r0 = dst_u32(_0{}, n);
+        uint32_t& r1 = dst_u32(_1{}, n);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
 // HOW cute::copy ORCHESTRATES THIS
 // ============================================================================
 //
@@ -668,8 +920,16 @@ struct CollectiveMainloopFwdSm80 {
         auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
         auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomTransposed{}, tiled_mma);
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+#else
+        Element const* smem_Q_ptr = raw_pointer_cast(sQ.data());
+#endif
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+#else
+        Element const* smem_K_ptr = raw_pointer_cast(sK.data());
+#endif
         Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
 
         // Predicates
@@ -1365,7 +1625,11 @@ struct CollectiveMainloopFwdSm80 {
             // ============================================================================
             {
                 // Get the current K tile from shared memory (handles pipeline staging)
+#if FLASH_USE_CUTLASS_TENSOR
                 auto tCsK_cur = tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0);
+#else
+                Element const* smem_K_stage_ptr = smem_K_ptr + (kStages > 1 ? smem_pipe_read : 0) * kBlockN * kHeadDim;
+#endif
                 
                 // Create "retiled" views that match the hardware's expected register layout
                 // for the LDSM (Load Shared Memory) instructions.
@@ -1402,6 +1666,7 @@ struct CollectiveMainloopFwdSm80 {
                 //
                 // Load Q[*, *, k=0] from shared memory to registers (if not already in regs)
                 //if constexpr (!Q_in_regs) {
+#if FLASH_USE_CUTLASS_TENSOR
                 if constexpr (UseSM80MMA) {
                     flash::educational_copy_smem_to_regs(
                         smem_tiled_copy_Q, tSsQ(_, _, _0{}), tCrQ_copy_view(_, _, _0{}));
@@ -1409,8 +1674,18 @@ struct CollectiveMainloopFwdSm80 {
                     flash::educational_copy_smem_to_regs_x2(
                         smem_tiled_copy_Q, tSsQ(_, _, _0{}), tCrQ_copy_view(_, _, _0{}));
                 }
+#else
+                if constexpr (UseSM80MMA) {
+                    flash::copy_Q_smem_to_regs_manual<kBlockM, kHeadDim, kNWarps>(
+                        smem_Q_ptr, thread_idx, 0, tCrQ_copy_view(_, _, _0{}));
+                } else {
+                    flash::copy_Q_smem_to_regs_manual_x2<kBlockM, kHeadDim, kNWarps>(
+                        smem_Q_ptr, thread_idx, 0, tCrQ_copy_view(_, _, _0{}));
+                }
+#endif
                 //}
                 // Load K[*, *, k=0] from shared memory to registers
+#if FLASH_USE_CUTLASS_TENSOR
                 if constexpr (UseSM80MMA) {
                     flash::educational_copy_smem_to_regs(
                         smem_tiled_copy_K, tCsK_cur(_, _, _0{}), tCrK_copy_view(_, _, _0{}));
@@ -1418,6 +1693,15 @@ struct CollectiveMainloopFwdSm80 {
                     flash::educational_copy_smem_to_regs_x2(
                         smem_tiled_copy_K, tCsK_cur(_, _, _0{}), tCrK_copy_view(_, _, _0{}));
                 }
+#else
+                if constexpr (UseSM80MMA) {
+                    flash::copy_K_smem_to_regs_manual<kHeadDim>(
+                        smem_K_stage_ptr, thread_idx, 0, tCrK_copy_view(_, _, _0{}));
+                } else {
+                    flash::copy_K_smem_to_regs_manual_x2<kHeadDim>(
+                        smem_K_stage_ptr, thread_idx, 0, tCrK_copy_view(_, _, _0{}));
+                }
+#endif
                 
                 // ========================================================================
                 // PHASE 2: Main K-dimension loop with software pipelining
@@ -1446,17 +1730,42 @@ struct CollectiveMainloopFwdSm80 {
                     // k indices: we write to tCrQ[k+1] while reading from tCrQ[k]
                     //
                     if (k_block < size<2>(tSrQ_cur) - 1) {
+                        // Load next Q slice from smem → registers
+#if FLASH_USE_CUTLASS_TENSOR
                         if constexpr (UseSM80MMA) {
                             flash::educational_copy_smem_to_regs(
                                 smem_tiled_copy_Q, tSsQ(_, _, k_block + 1), tCrQ_copy_view(_, _, k_block + 1));
+                        } else {
+                            flash::educational_copy_smem_to_regs_x2(
+                                smem_tiled_copy_Q, tSsQ(_, _, k_block + 1), tCrQ_copy_view(_, _, k_block + 1));
+                        }
+#else
+                        if constexpr (UseSM80MMA) {
+                            flash::copy_Q_smem_to_regs_manual<kBlockM, kHeadDim, kNWarps>(
+                                smem_Q_ptr, thread_idx, k_block + 1, tCrQ_copy_view(_, _, k_block + 1));
+                        } else {
+                            flash::copy_Q_smem_to_regs_manual_x2<kBlockM, kHeadDim, kNWarps>(
+                                smem_Q_ptr, thread_idx, k_block + 1, tCrQ_copy_view(_, _, k_block + 1));
+                        }
+#endif
+                        // Load next K slice from smem → registers
+#if FLASH_USE_CUTLASS_TENSOR
+                        if constexpr (UseSM80MMA) {
                             flash::educational_copy_smem_to_regs(
                                 smem_tiled_copy_K, tCsK_cur(_, _, k_block + 1), tCrK_copy_view(_, _, k_block + 1));
                         } else {
                             flash::educational_copy_smem_to_regs_x2(
-                                smem_tiled_copy_Q, tSsQ(_, _, k_block + 1), tCrQ_copy_view(_, _, k_block + 1));
-                            flash::educational_copy_smem_to_regs_x2(
                                 smem_tiled_copy_K, tCsK_cur(_, _, k_block + 1), tCrK_copy_view(_, _, k_block + 1));
                         }
+#else
+                        if constexpr (UseSM80MMA) {
+                            flash::copy_K_smem_to_regs_manual<kHeadDim>(
+                                smem_K_stage_ptr, thread_idx, k_block + 1, tCrK_copy_view(_, _, k_block + 1));
+                        } else {
+                            flash::copy_K_smem_to_regs_manual_x2<kHeadDim>(
+                                smem_K_stage_ptr, thread_idx, k_block + 1, tCrK_copy_view(_, _, k_block + 1));
+                        }
+#endif
                     }
                     
                     // --------------------------------------------------------------------
