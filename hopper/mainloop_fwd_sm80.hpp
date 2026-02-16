@@ -259,9 +259,9 @@ CUTLASS_DEVICE void educational_copy_smem_to_regs_transposed(
 // ============================================================================
 //
 // These functions replace the CuTe shared memory tensor (tSsQ) with manual
-// index calculation for the Q matrix smem→register copy.  The register tensor
-// (tCrQ_copy_view) is kept as a CuTe tensor — only the source smem address is
-// computed by hand.
+// index calculation for the Q matrix smem→register copy.  The destination is
+// either a CuTe register tensor (tCrQ_copy_view) or a raw uint32_t array,
+// depending on the variant used (see _raw_regs variants below).
 //
 // Address derivation (row-major Q in smem, no swizzle):
 //
@@ -386,6 +386,122 @@ CUTLASS_DEVICE void copy_Q_smem_to_regs_manual_x2(
         asm volatile(
             "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
             : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
+// MANUAL ADDRESS CALCULATION: smem→register copy for Q matrix — RAW REGISTER variant
+// ============================================================================
+//
+// These functions are identical to copy_Q_smem_to_regs_manual[_x2] in the
+// shared-memory address calculation, but write directly to a raw uint32_t
+// array instead of a CuTe register tensor.
+//
+// Flat array layout:
+//   Q_regs_k[m * VRegsPerAtom + v]
+//   m = MMA atom index in the M direction (per warp), v = uint32 sub-register.
+//   SM75 (x2): VRegsPerAtom = 2, so Q_regs_k[m * 2 + v]    (v ∈ {0,1})
+//   SM80 (x4): VRegsPerAtom = 4, so Q_regs_k[m * 4 + v]    (v ∈ {0,1,2,3})
+//
+// The caller passes a pointer to the slice for one k_block:
+//   &Q_regs[k_block * RegsPerKBlockQ]
+//
+// ============================================================================
+
+// SM80 variant (ldmatrix.x4): writes to raw uint32_t array.
+template<int kBlockM_, int kHeadDim_, int kNWarps_, typename Element_>
+CUTLASS_DEVICE void copy_Q_smem_to_raw_regs(
+    Element_ const* smem_Q_base,
+    int thread_idx,
+    int k_block,
+    uint32_t* Q_regs_k)   // output: NAtomsM * 4 uint32 for this k_block
+{
+    // K-dim of SM80 MMA atom mma.sync.aligned.m16n8k16 (PTX ISA).
+    static constexpr int MmaTileK = 16;
+    // M-dim of MMA atom (16 rows).
+    static constexpr int MmaAtomM = 16;
+    // Total M rows per MMA tile = MmaAtomM * kNWarps.
+    static constexpr int MmaTileM = 16 * kNWarps_;
+    // A-operand registers per atom: 4 uint32 (8 fp16).
+    static constexpr int VRegsPerAtom = 4;
+    // Number of M-atom steps per warp.
+    static constexpr int NAtomsM = kBlockM_ / MmaTileM;
+
+    // 32 threads per warp (CUDA warp size).
+    int const warp_id = thread_idx / 32;
+    int const lane_id = thread_idx % 32;
+    // 4 groups of 8 lanes; each group addresses one 8×8 sub-matrix (PTX ISA).
+    int const group = lane_id / 8;          // 0..3
+    int const row_in_group = lane_id % 8;   // 0..7
+
+    // Same 2×2 sub-matrix layout as the non-raw Q x4 variant.
+    int const row_offset = (group % 2) * 8 + row_in_group;
+    int const col_offset = (group / 2) * 8;
+
+    #pragma unroll
+    for (int m = 0; m < NAtomsM; ++m) {
+        int const atom_row_start = m * MmaTileM + warp_id * MmaAtomM;
+        int const smem_row = atom_row_start + row_offset;
+        int const smem_col = k_block * MmaTileK + col_offset;
+
+        Element_ const* addr = smem_Q_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        // ldmatrix.x4: 4 sequential registers per atom (A-operand is row-major).
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(Q_regs_k[m * VRegsPerAtom + 0]),
+              "=r"(Q_regs_k[m * VRegsPerAtom + 1]),
+              "=r"(Q_regs_k[m * VRegsPerAtom + 2]),
+              "=r"(Q_regs_k[m * VRegsPerAtom + 3])
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// SM75 variant (ldmatrix.x2): writes to raw uint32_t array.
+template<int kBlockM_, int kHeadDim_, int kNWarps_, typename Element_>
+CUTLASS_DEVICE void copy_Q_smem_to_raw_regs_x2(
+    Element_ const* smem_Q_base,
+    int thread_idx,
+    int k_block,
+    uint32_t* Q_regs_k)   // output: NAtomsM * 2 uint32 for this k_block
+{
+    // K-dim of SM75 MMA atom mma.sync.aligned.m16n8k8 (PTX ISA).
+    static constexpr int MmaTileK = 8;
+    // M-dim of MMA atom (16 rows).
+    static constexpr int MmaAtomM = 16;
+    // Total M rows per MMA tile = MmaAtomM * kNWarps.
+    static constexpr int MmaTileM = 16 * kNWarps_;
+    // A-operand registers per atom: 2 uint32 (4 fp16).
+    static constexpr int VRegsPerAtom = 2;
+    // Number of M-atom steps per warp.
+    static constexpr int NAtomsM = kBlockM_ / MmaTileM;
+
+    // 32 threads per warp (CUDA warp size).
+    int const warp_id = thread_idx / 32;
+    int const lane_id = thread_idx % 32;
+    // Same vertical sub-matrix mapping as the non-raw Q x2 variant.
+    int const sub_matrix = (lane_id / 8) % 2;  // 0 = top 8×8, 1 = bottom 8×8
+    int const row_in_sub = lane_id % 8;         // 0..7
+    int const row_offset = sub_matrix * 8 + row_in_sub;
+
+    #pragma unroll
+    for (int m = 0; m < NAtomsM; ++m) {
+        int const atom_row_start = m * MmaTileM + warp_id * MmaAtomM;
+        int const smem_row = atom_row_start + row_offset;
+        int const smem_col = k_block * MmaTileK;
+
+        Element_ const* addr = smem_Q_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        // ldmatrix.x2: 2 sequential registers per atom.
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(Q_regs_k[m * VRegsPerAtom + 0]),
+              "=r"(Q_regs_k[m * VRegsPerAtom + 1])
             : "r"(smem_addr)
         );
     }
@@ -1287,7 +1403,9 @@ struct CollectiveMainloopFwdSm80 {
         auto thr_mma = tiled_mma.get_slice(thread_idx);
 
         // Allocate "fragments/descriptors"
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
+#endif
 
         // Copy Atom retiling
         auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
@@ -1922,7 +2040,24 @@ struct CollectiveMainloopFwdSm80 {
                 }
                 cute::cp_async_fence();
             };
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
+#else
+            // Raw Q register array: flat array of uint32_t, manually indexed.
+            // Layout: Q_regs[k_block * RegsPerKBlockQ + atom_m * VRegsPerAtomQ + v_reg]
+            //   atom_m = MMA atom index in M per warp (0..NAtomsM-1)
+            //   v_reg  = uint32 sub-register (0..1 for SM75, 0..3 for SM80)
+            //
+            // Q is the A-operand of Q×K^T: M=kBlockM, N=kBlockN, K=kHeadDim (reduction).
+            // Warps are distributed along M: each warp handles kBlockM/kNWarps rows.
+            static_assert(!Q_in_regs, "Raw Q registers require Q_in_regs=false");
+            static constexpr int MmaTileK_Q = UseSM80MMA ? 16 : 8;          // MMA atom K-dim
+            static constexpr int KBlocksQ = kHeadDim / MmaTileK_Q;          // k-steps
+            static constexpr int NAtomsM = kBlockM / (16 * kNWarps);         // M-atoms per warp (atom_M=16)
+            static constexpr int VRegsPerAtomQ = UseSM80MMA ? 4 : 2;        // uint32 per A atom
+            static constexpr int RegsPerKBlockQ = NAtomsM * VRegsPerAtomQ;
+            uint32_t Q_regs[KBlocksQ * RegsPerKBlockQ];
+#endif
 #if FLASH_USE_CUTLASS_TENSOR
             Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
 #else
@@ -2031,8 +2166,8 @@ struct CollectiveMainloopFwdSm80 {
                 // for the LDSM (Load Shared Memory) instructions.
                 // These views remap the logical tensor indices to the physical register layout
                 // that Tensor Cores expect for efficient matrix fragment loading.
-                Tensor tCrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ_cur);  // Retiled view for Q
 #if FLASH_USE_CUTLASS_TENSOR
+                Tensor tCrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ_cur);  // Retiled view for Q
                 Tensor tCrK_copy_view = smem_thr_copy_K.retile_D(tSrK);      // Retiled view for K
 #endif
                 
@@ -2074,11 +2209,11 @@ struct CollectiveMainloopFwdSm80 {
                 }
 #else
                 if constexpr (UseSM80MMA) {
-                    flash::copy_Q_smem_to_regs_manual<kBlockM, kHeadDim, kNWarps>(
-                        smem_Q_ptr, thread_idx, 0, tCrQ_copy_view(_, _, _0{}));
+                    flash::copy_Q_smem_to_raw_regs<kBlockM, kHeadDim, kNWarps>(
+                        smem_Q_ptr, thread_idx, 0, &Q_regs[0 * RegsPerKBlockQ]);
                 } else {
-                    flash::copy_Q_smem_to_regs_manual_x2<kBlockM, kHeadDim, kNWarps>(
-                        smem_Q_ptr, thread_idx, 0, tCrQ_copy_view(_, _, _0{}));
+                    flash::copy_Q_smem_to_raw_regs_x2<kBlockM, kHeadDim, kNWarps>(
+                        smem_Q_ptr, thread_idx, 0, &Q_regs[0 * RegsPerKBlockQ]);
                 }
 #endif
                 //}
@@ -2108,7 +2243,11 @@ struct CollectiveMainloopFwdSm80 {
                 // - While computing MMA for tile k, we prefetch tile k+1 from smem
                 // - This hides memory latency behind compute
                 #pragma unroll
+#if FLASH_USE_CUTLASS_TENSOR
                 for (int k_block = 0; k_block < size<2>(tSrQ_cur); ++k_block) {
+#else
+                for (int k_block = 0; k_block < KBlocksQ; ++k_block) {
+#endif
                     
                     // --------------------------------------------------------------------
                     // PREFETCH: Load NEXT k-slice while current MMA is in flight
@@ -2127,7 +2266,11 @@ struct CollectiveMainloopFwdSm80 {
                     // The registers are double-buffered implicitly by using different
                     // k indices: we write to tCrQ[k+1] while reading from tCrQ[k]
                     //
+#if FLASH_USE_CUTLASS_TENSOR
                     if (k_block < size<2>(tSrQ_cur) - 1) {
+#else
+                    if (k_block < KBlocksQ - 1) {
+#endif
                         // Load next Q slice from smem → registers
 #if FLASH_USE_CUTLASS_TENSOR
                         if constexpr (UseSM80MMA) {
@@ -2139,11 +2282,11 @@ struct CollectiveMainloopFwdSm80 {
                         }
 #else
                         if constexpr (UseSM80MMA) {
-                            flash::copy_Q_smem_to_regs_manual<kBlockM, kHeadDim, kNWarps>(
-                                smem_Q_ptr, thread_idx, k_block + 1, tCrQ_copy_view(_, _, k_block + 1));
+                            flash::copy_Q_smem_to_raw_regs<kBlockM, kHeadDim, kNWarps>(
+                                smem_Q_ptr, thread_idx, k_block + 1, &Q_regs[(k_block + 1) * RegsPerKBlockQ]);
                         } else {
-                            flash::copy_Q_smem_to_regs_manual_x2<kBlockM, kHeadDim, kNWarps>(
-                                smem_Q_ptr, thread_idx, k_block + 1, tCrQ_copy_view(_, _, k_block + 1));
+                            flash::copy_Q_smem_to_raw_regs_x2<kBlockM, kHeadDim, kNWarps>(
+                                smem_Q_ptr, thread_idx, k_block + 1, &Q_regs[(k_block + 1) * RegsPerKBlockQ]);
                         }
 #endif
                         // Load next K slice from smem → registers
@@ -2236,7 +2379,11 @@ struct CollectiveMainloopFwdSm80 {
                         // M = number of MMA-atom steps in the M direction for this warp.
                         // tSrQ_cur is (V, M, K): dim 1 = MmaTileM / (atom_M * kNWarps).
                         // MmaTileM = 16*kNWarps = 64, atom_M = 16, kNWarps = 4: M = 64/(16*4) = 1.
+#if FLASH_USE_CUTLASS_TENSOR
                         int const M = size<1>(tSrQ_cur);
+#else
+                        static constexpr int M = NAtomsM;
+#endif
                         // N = number of MMA-atom steps in the N direction.
                         // MmaTileN = 16 (from TiledMma Tile<..., _16, ...>), atom_N = 8.
                         // N = kBlockN / atom_N total atom steps across all tiles.
@@ -2263,17 +2410,20 @@ struct CollectiveMainloopFwdSm80 {
                                 constexpr int RegNumB = std::extent<typename MMA_Op::BRegisters>::value;
                                 constexpr int RegNumC = std::extent<typename MMA_Op::CRegisters>::value;
                                 auto D_slice = tSrS(_, m, ns);
-                                auto A_slice = tSrQ_cur(_, m, k_block);
                                 auto C_slice = tSrS(_, m, ns);
                                 auto rD = recast<RegTypeD>(D_slice);
-                                auto rA = recast<RegTypeA>(A_slice);
 #if FLASH_USE_CUTLASS_TENSOR
+                                auto A_slice = tSrQ_cur(_, m, k_block);
+                                auto rA = recast<RegTypeA>(A_slice);
                                 auto B_slice = tSrK(_, ns, k_block);
                                 auto rB = recast<RegTypeB>(B_slice);
 #else
-                                // Raw K register access: index into the flat array.
-                                // For SM75: RegNumB=1 → 1 uint32 per atom at K_regs[k*RegsPerKBlock + ns]
-                                // For SM80: RegNumB=2 → 2 uint32 per atom at K_regs[k*RegsPerKBlock + ns*2 + {0,1}]
+                                // Raw Q register access: index into flat array.
+                                // For SM75: RegNumA=2 → 2 uint32 per atom at Q_regs[k*RegsPerKBlockQ + m*2 + {0,1}]
+                                // For SM80: RegNumA=4 → 4 uint32 per atom at Q_regs[k*RegsPerKBlockQ + m*4 + {0,1,2,3}]
+                                flash::RawRegs<RegTypeA, RegNumA> rA{reinterpret_cast<RegTypeA*>(
+                                    &Q_regs[k_block * RegsPerKBlockQ + m * VRegsPerAtomQ])};
+                                // Raw K register access.
                                 flash::RawRegs<RegTypeB, RegNumB> rB{reinterpret_cast<RegTypeB*>(
                                     &K_regs[k_block * RegsPerKBlock + ns * VRegsPerAtomK])};
 #endif
