@@ -507,6 +507,131 @@ CUTLASS_DEVICE void copy_K_smem_to_regs_manual_x2(
 }
 
 // ============================================================================
+// MANUAL ADDRESS CALCULATION: smem→register copy for K matrix — RAW REGISTER variant
+// ============================================================================
+//
+// These functions are identical to copy_K_smem_to_regs_manual[_x2] in the
+// shared-memory address calculation, but write directly to a raw uint32_t
+// array instead of a CuTe register tensor.
+//
+// Flat array layout:
+//   K_regs_k[ns * VRegsPerAtom + v]
+//   ns = MMA atom index in the N direction, v = uint32 sub-register index.
+//   SM75 (x2): VRegsPerAtom = 1, so K_regs_k[ns]
+//   SM80 (x4): VRegsPerAtom = 2, so K_regs_k[ns * 2 + v]
+//
+// The caller passes a pointer to the slice for one k_block:
+//   &K_regs[k_block * RegsPerKBlock]
+//
+// ============================================================================
+
+// SM80 variant (ldmatrix.x4): writes to raw uint32_t array.
+template<int kHeadDim_, int kBlockN_, typename Element_>
+CUTLASS_DEVICE void copy_K_smem_to_raw_regs(
+    Element_ const* smem_K_stage_base,
+    int thread_idx,
+    int k_block,
+    uint32_t* K_regs_k)   // output: (kBlockN_/8)*2 uint32 for this k_block
+{
+    // K-dim of SM80 MMA atom mma.sync.aligned.m16n8k16 (PTX ISA).
+    static constexpr int MmaTileK = 16;
+    // ldmatrix.x4 covers 16 N-rows per call (2 vertical × 8 rows per m8n8).
+    static constexpr int NPerLdmatrix = 16;
+    // Each MMA atom (8 N-rows) has 2 uint32 B-operand registers (4 fp16).
+    static constexpr int VRegsPerAtom = 2;
+    // Number of ldmatrix calls to cover all kBlockN_ rows.
+    static constexpr int N_CPY = kBlockN_ / NPerLdmatrix;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+    // 4 groups of 8 lanes; each group addresses one 8×8 sub-matrix (PTX ISA).
+    int const group = lane_id / 8;          // 0..3
+    int const row_in_group = lane_id % 8;   // 0..7
+
+    // Same 2×2 sub-matrix layout as the Q x4 variant (see comments there).
+    int const row_offset = (group % 2) * 8 + row_in_group;
+    int const col_offset = (group / 2) * 8;
+
+    #pragma unroll
+    for (int n = 0; n < N_CPY; ++n) {
+        int const smem_row = n * NPerLdmatrix + row_offset;
+        int const smem_col = k_block * MmaTileK + col_offset;
+
+        Element_ const* addr = smem_K_stage_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t r0, r1, r2, r3;
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+        // ldmatrix.x4 sub-matrix → MMA atom register mapping:
+        //   r0: (rows 0-7,  cols 0-7)  → atom ns=2*n+0, v=0
+        //   r1: (rows 8-15, cols 0-7)  → atom ns=2*n+1, v=0
+        //   r2: (rows 0-7,  cols 8-15) → atom ns=2*n+0, v=1
+        //   r3: (rows 8-15, cols 8-15) → atom ns=2*n+1, v=1
+        K_regs_k[(2*n+0) * VRegsPerAtom + 0] = r0;
+        K_regs_k[(2*n+1) * VRegsPerAtom + 0] = r1;
+        K_regs_k[(2*n+0) * VRegsPerAtom + 1] = r2;
+        K_regs_k[(2*n+1) * VRegsPerAtom + 1] = r3;
+    }
+}
+
+// SM75 variant (ldmatrix.x2): writes to raw uint32_t array.
+template<int kHeadDim_, int kBlockN_, typename Element_>
+CUTLASS_DEVICE void copy_K_smem_to_raw_regs_x2(
+    Element_ const* smem_K_stage_base,
+    int thread_idx,
+    int k_block,
+    uint32_t* K_regs_k)   // output: kBlockN_/8 uint32 for this k_block
+{
+    // K-dim of SM75 MMA atom mma.sync.aligned.m16n8k8 (PTX ISA).
+    static constexpr int MmaTileK = 8;
+    // ldmatrix.x2 covers 16 N-rows per call (2 vertical × 8 rows per m8n8).
+    static constexpr int NPerLdmatrix = 16;
+    // Number of ldmatrix calls to cover all kBlockN_ rows.
+    static constexpr int N_CPY = kBlockN_ / NPerLdmatrix;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+    // Same vertical sub-matrix mapping as the Q x2 variant (see comments there).
+    int const sub_matrix = (lane_id / 8) % 2;  // 0 = top 8×8, 1 = bottom 8×8
+    int const row_in_sub = lane_id % 8;         // 0..7 → row within that 8×8
+    int const row_offset = sub_matrix * 8 + row_in_sub;
+
+    #pragma unroll
+    for (int n = 0; n < N_CPY; ++n) {
+        int const smem_row = n * NPerLdmatrix + row_offset;
+        int const smem_col = k_block * MmaTileK;
+
+        Element_ const* addr = smem_K_stage_base + smem_row * kHeadDim_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        // ldmatrix.x2: r0 → atom ns=2*n+0, r1 → atom ns=2*n+1
+        // For SM75 (VRegsPerAtom=1), flat layout: K_regs_k[ns]
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(K_regs_k[2*n + 0]), "=r"(K_regs_k[2*n + 1])
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
+// RawRegs: minimal wrapper around a raw register pointer for use with
+// cute::detail::explode.  Provides operator[] (used by explode to access
+// register elements) indexing into a contiguous array of uint32_t (or other
+// register type) values.
+// ============================================================================
+template<typename T, int N>
+struct RawRegs {
+    T* data;
+    CUTE_HOST_DEVICE constexpr T& operator[](int i) { return data[i]; }
+    CUTE_HOST_DEVICE constexpr T const& operator[](int i) const { return data[i]; }
+};
+
+// ============================================================================
 // MANUAL ADDRESS CALCULATION: smem→register TRANSPOSED copy for V matrix
 // ============================================================================
 //
@@ -632,6 +757,126 @@ CUTLASS_DEVICE void copy_V_smem_to_regs_manual_transposed_x2(
         asm volatile(
             "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
             : "=r"(r0), "=r"(r1)
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
+// MANUAL ADDRESS CALCULATION: smem→register TRANSPOSED copy for V — RAW REGISTER variant
+// ============================================================================
+//
+// These functions are identical to copy_V_smem_to_regs_manual_transposed[_x2]
+// in the shared-memory address calculation, but write directly to a raw
+// uint32_t array instead of a CuTe register tensor.
+//
+// Flat array layout (same as K raw copy — see copy_K_smem_to_raw_regs):
+//   V_regs_k[ns * VRegsPerAtom + v]
+//   ns = MMA atom index in the N (headdim) direction, v = uint32 sub-register.
+//   SM75 (x2.trans): VRegsPerAtom = 1, so V_regs_k[ns]
+//   SM80 (x4.trans): VRegsPerAtom = 2, so V_regs_k[ns * 2 + v]
+//
+// The caller passes a pointer to the slice for one k_block:
+//   &V_regs[k_block * RegsPerKBlockV]
+//
+// ============================================================================
+
+// SM80 variant (ldmatrix.x4.trans): writes to raw uint32_t array.
+// kSmemStride_ = physical row stride of V in smem (= kHeadDim, may differ from kHeadDimV_).
+// kHeadDimV_   = V head dimension (number of headdim cols to load).
+template<int kSmemStride_, int kHeadDimV_, typename Element_>
+CUTLASS_DEVICE void copy_V_smem_to_raw_regs_transposed(
+    Element_ const* smem_V_base,
+    int thread_idx,
+    int k_block,
+    uint32_t* V_regs_k)   // output: (kHeadDimV_/8)*2 uint32 for this k_block
+{
+    // K-dim of SM80 MMA atom mma.sync.aligned.m16n8k16 (PTX ISA).
+    // For the P×V GEMM, K = kBlockN (token reduction), stepped in MmaTileK.
+    static constexpr int MmaTileK = 16;
+    // ldmatrix.x4.trans covers 16 headdim-cols per call (2 horizontal × 8 per m8n8).
+    static constexpr int NPerLdmatrix = 16;
+    // Each MMA atom (8 headdim-rows) has 2 uint32 B-operand registers (4 fp16).
+    static constexpr int VRegsPerAtom = 2;
+    // Number of ldmatrix calls to cover all kHeadDimV_ columns.
+    static constexpr int N_CPY = kHeadDimV_ / NPerLdmatrix;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+    // 4 groups of 8 lanes (PTX ISA: each group addresses one 8×8 sub-matrix).
+    int const group = lane_id / 8;
+    int const row_in_group = lane_id % 8;
+
+    // TRANSPOSED mapping (see copy_V_smem_to_regs_manual_transposed):
+    //   group/2 selects token-ROW block, group%2 selects headdim-COLUMN block.
+    int const row_offset = (group / 2) * 8 + row_in_group;   // token rows
+    int const col_offset = (group % 2) * 8;                   // headdim cols
+
+    #pragma unroll
+    for (int n = 0; n < N_CPY; ++n) {
+        int const smem_row = k_block * MmaTileK + row_offset;
+        int const smem_col = n * NPerLdmatrix + col_offset;
+
+        Element_ const* addr = smem_V_base + smem_row * kSmemStride_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        uint32_t r0, r1, r2, r3;
+        asm volatile(
+            "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+            : "r"(smem_addr)
+        );
+        // ldmatrix.x4.trans sub-matrix → MMA atom register mapping
+        // (same pattern as non-transposed K — see copy_K_smem_to_raw_regs):
+        //   r0: headdim 0-7,  tokens 0-7  → atom ns=2*n+0, v=0
+        //   r1: headdim 8-15, tokens 0-7  → atom ns=2*n+1, v=0
+        //   r2: headdim 0-7,  tokens 8-15 → atom ns=2*n+0, v=1
+        //   r3: headdim 8-15, tokens 8-15 → atom ns=2*n+1, v=1
+        V_regs_k[(2*n+0) * VRegsPerAtom + 0] = r0;
+        V_regs_k[(2*n+1) * VRegsPerAtom + 0] = r1;
+        V_regs_k[(2*n+0) * VRegsPerAtom + 1] = r2;
+        V_regs_k[(2*n+1) * VRegsPerAtom + 1] = r3;
+    }
+}
+
+// SM75 variant (ldmatrix.x2.trans): writes to raw uint32_t array.
+// kSmemStride_ = physical row stride of V in smem (= kHeadDim, may differ from kHeadDimV_).
+// kHeadDimV_   = V head dimension (number of headdim cols to load).
+template<int kSmemStride_, int kHeadDimV_, typename Element_>
+CUTLASS_DEVICE void copy_V_smem_to_raw_regs_transposed_x2(
+    Element_ const* smem_V_base,
+    int thread_idx,
+    int k_block,
+    uint32_t* V_regs_k)   // output: kHeadDimV_/8 uint32 for this k_block
+{
+    // K-dim of SM75 MMA atom mma.sync.aligned.m16n8k8 (PTX ISA).
+    static constexpr int MmaTileK = 8;
+    // ldmatrix.x2.trans covers 16 headdim-cols per call (2 horizontal × 8).
+    static constexpr int NPerLdmatrix = 16;
+    // Number of ldmatrix calls to cover all kHeadDimV_ columns.
+    static constexpr int N_CPY = kHeadDimV_ / NPerLdmatrix;
+
+    // 32 threads per warp (CUDA warp size).
+    int const lane_id = thread_idx % 32;
+
+    // TRANSPOSED mapping (see copy_V_smem_to_regs_manual_transposed_x2):
+    //   sub_matrix selects headdim-COLUMN block (not row block).
+    int const sub_matrix = (lane_id / 8) % 2;  // selects headdim column block
+    int const row_in_sub = lane_id % 8;         // 0..7 → token row
+
+    #pragma unroll
+    for (int n = 0; n < N_CPY; ++n) {
+        int const smem_row = k_block * MmaTileK + row_in_sub;
+        int const smem_col = n * NPerLdmatrix + sub_matrix * 8;
+
+        Element_ const* addr = smem_V_base + smem_row * kSmemStride_ + smem_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        // ldmatrix.x2.trans: r0 → atom ns=2*n+0, r1 → atom ns=2*n+1
+        // For SM75 (VRegsPerAtom=1), flat layout: V_regs_k[ns]
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(V_regs_k[2*n + 0]), "=r"(V_regs_k[2*n + 1])
             : "r"(smem_addr)
         );
     }
@@ -1678,7 +1923,23 @@ struct CollectiveMainloopFwdSm80 {
                 cute::cp_async_fence();
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+#else
+            // Raw K register array: flat array of uint32_t, manually indexed.
+            // Layout: K_regs[k_block * RegsPerKBlock + atom_n * VRegsPerAtomK + v_reg]
+            //   atom_n = MMA atom index in the N direction (0..NAtomsK-1)
+            //   v_reg  = uint32 sub-register within one atom (0 for SM75, 0..1 for SM80)
+            //
+            // SM75 (m16n8k8):  VRegsPerAtomK=1, each B atom has 1 uint32 (2 fp16)
+            // SM80 (m16n8k16): VRegsPerAtomK=2, each B atom has 2 uint32 (4 fp16)
+            static constexpr int MmaTileK_val = UseSM80MMA ? 16 : 8;  // from MMA atom K-dim
+            static constexpr int KBlocksK = kHeadDim / MmaTileK_val;  // k-steps in the GEMM
+            static constexpr int NAtomsK = kBlockN / 8;               // atom_N = 8 for both SM75/SM80
+            static constexpr int VRegsPerAtomK = UseSM80MMA ? 2 : 1;  // uint32 per B atom per thread
+            static constexpr int RegsPerKBlock = NAtomsK * VRegsPerAtomK;
+            uint32_t K_regs[KBlocksK * RegsPerKBlock];
+#endif
 
 // ============================================================================
 // SWITCH: Change #if 0 to #if 1 to use FULLY MANUAL version (no CuTe tensors)
@@ -1771,7 +2032,9 @@ struct CollectiveMainloopFwdSm80 {
                 // These views remap the logical tensor indices to the physical register layout
                 // that Tensor Cores expect for efficient matrix fragment loading.
                 Tensor tCrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ_cur);  // Retiled view for Q
+#if FLASH_USE_CUTLASS_TENSOR
                 Tensor tCrK_copy_view = smem_thr_copy_K.retile_D(tSrK);      // Retiled view for K
+#endif
                 
                 // ========================================================================
                 // PHASE 1: Load first K-slice (k=0) from Shared Memory → Registers
@@ -1830,11 +2093,11 @@ struct CollectiveMainloopFwdSm80 {
                 }
 #else
                 if constexpr (UseSM80MMA) {
-                    flash::copy_K_smem_to_regs_manual<kHeadDim>(
-                        smem_K_stage_ptr, thread_idx, 0, tCrK_copy_view(_, _, _0{}));
+                    flash::copy_K_smem_to_raw_regs<kHeadDim, kBlockN>(
+                        smem_K_stage_ptr, thread_idx, 0, &K_regs[0]);
                 } else {
-                    flash::copy_K_smem_to_regs_manual_x2<kHeadDim>(
-                        smem_K_stage_ptr, thread_idx, 0, tCrK_copy_view(_, _, _0{}));
+                    flash::copy_K_smem_to_raw_regs_x2<kHeadDim, kBlockN>(
+                        smem_K_stage_ptr, thread_idx, 0, &K_regs[0]);
                 }
 #endif
                 
@@ -1894,11 +2157,11 @@ struct CollectiveMainloopFwdSm80 {
                         }
 #else
                         if constexpr (UseSM80MMA) {
-                            flash::copy_K_smem_to_regs_manual<kHeadDim>(
-                                smem_K_stage_ptr, thread_idx, k_block + 1, tCrK_copy_view(_, _, k_block + 1));
+                            flash::copy_K_smem_to_raw_regs<kHeadDim, kBlockN>(
+                                smem_K_stage_ptr, thread_idx, k_block + 1, &K_regs[(k_block + 1) * RegsPerKBlock]);
                         } else {
-                            flash::copy_K_smem_to_regs_manual_x2<kHeadDim>(
-                                smem_K_stage_ptr, thread_idx, k_block + 1, tCrK_copy_view(_, _, k_block + 1));
+                            flash::copy_K_smem_to_raw_regs_x2<kHeadDim, kBlockN>(
+                                smem_K_stage_ptr, thread_idx, k_block + 1, &K_regs[(k_block + 1) * RegsPerKBlock]);
                         }
 #endif
                     }
@@ -1975,9 +2238,13 @@ struct CollectiveMainloopFwdSm80 {
                         // MmaTileM = 16*kNWarps = 64, atom_M = 16, kNWarps = 4: M = 64/(16*4) = 1.
                         int const M = size<1>(tSrQ_cur);
                         // N = number of MMA-atom steps in the N direction.
-                        // tSrK is (V, N, K): dim 1 = MmaTileN / atom_N.
-                        // MmaTileN = 16 (from TiledMma Tile<..., _16, ...>), atom_N = 8: N = 16/8 = 2.
+                        // MmaTileN = 16 (from TiledMma Tile<..., _16, ...>), atom_N = 8.
+                        // N = kBlockN / atom_N total atom steps across all tiles.
+#if FLASH_USE_CUTLASS_TENSOR
                         int const N = size<1>(tSrK);
+#else
+                        static constexpr int N = NAtomsK;
+#endif
                         #pragma unroll
                         for (int m = 0; m < M; ++m) {
                             #pragma unroll
@@ -1997,11 +2264,19 @@ struct CollectiveMainloopFwdSm80 {
                                 constexpr int RegNumC = std::extent<typename MMA_Op::CRegisters>::value;
                                 auto D_slice = tSrS(_, m, ns);
                                 auto A_slice = tSrQ_cur(_, m, k_block);
-                                auto B_slice = tSrK(_, ns, k_block);
                                 auto C_slice = tSrS(_, m, ns);
                                 auto rD = recast<RegTypeD>(D_slice);
                                 auto rA = recast<RegTypeA>(A_slice);
+#if FLASH_USE_CUTLASS_TENSOR
+                                auto B_slice = tSrK(_, ns, k_block);
                                 auto rB = recast<RegTypeB>(B_slice);
+#else
+                                // Raw K register access: index into the flat array.
+                                // For SM75: RegNumB=1 → 1 uint32 per atom at K_regs[k*RegsPerKBlock + ns]
+                                // For SM80: RegNumB=2 → 2 uint32 per atom at K_regs[k*RegsPerKBlock + ns*2 + {0,1}]
+                                flash::RawRegs<RegTypeB, RegNumB> rB{reinterpret_cast<RegTypeB*>(
+                                    &K_regs[k_block * RegsPerKBlock + ns * VRegsPerAtomK])};
+#endif
                                 auto rC = recast<RegTypeC>(C_slice);
                                 cute::detail::explode(MMA_Op::fma,
                                     rD, cute::make_int_sequence<RegNumD>{},
@@ -2053,7 +2328,22 @@ struct CollectiveMainloopFwdSm80 {
             //{
             //    sync();
             //}
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
+#else
+            // Raw V register array: flat array of uint32_t, manually indexed.
+            // Layout: V_regs[k_block * RegsPerKBlockV + atom_n * VRegsPerAtomV + v_reg]
+            //   atom_n = MMA atom index in the N (headdim) direction (0..NAtomsV-1)
+            //   v_reg  = uint32 sub-register within one atom (0 for SM75, 0..1 for SM80)
+            //
+            // P×V GEMM dimensions: M=kBlockM, N=kHeadDimV, K=kBlockN (reduction).
+            static constexpr int MmaTileK_V = UseSM80MMA ? 16 : 8;     // MMA atom K-dim
+            static constexpr int KBlocksV = kBlockN / MmaTileK_V;      // k-steps for P×V
+            static constexpr int NAtomsV = kHeadDimV / 8;              // atom_N = 8
+            static constexpr int VRegsPerAtomV = UseSM80MMA ? 2 : 1;  // uint32 per B atom
+            static constexpr int RegsPerKBlockV = NAtomsV * VRegsPerAtomV;
+            uint32_t V_regs[KBlocksV * RegsPerKBlockV];
+#endif
 #if 0
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, /*kStages > 1 ? smem_pipe_read : */0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 #else
@@ -2085,7 +2375,9 @@ struct CollectiveMainloopFwdSm80 {
 #endif
                 
                 // Create retiled view for V that matches ldmatrix register layout
+#if FLASH_USE_CUTLASS_TENSOR
                 Tensor tCrV_copy_view = smem_thr_copy_V.retile_D(tOrV);
+#endif
                 
                 // ========================================================================
                 // PHASE 1: Load first K-slice of V from Shared Memory → Registers
@@ -2116,11 +2408,11 @@ struct CollectiveMainloopFwdSm80 {
                 }
 #else
                 if constexpr (UseSM80MMA) {
-                    flash::copy_V_smem_to_regs_manual_transposed<kHeadDim, kBlockN>(
-                        smem_V_stage_ptr, thread_idx, 0, tCrV_copy_view(_, _, _0{}));
+                    flash::copy_V_smem_to_raw_regs_transposed<kHeadDim, kHeadDimV>(
+                        smem_V_stage_ptr, thread_idx, 0, &V_regs[0]);
                 } else {
-                    flash::copy_V_smem_to_regs_manual_transposed_x2<kHeadDim, kBlockN>(
-                        smem_V_stage_ptr, thread_idx, 0, tCrV_copy_view(_, _, _0{}));
+                    flash::copy_V_smem_to_raw_regs_transposed_x2<kHeadDim, kHeadDimV>(
+                        smem_V_stage_ptr, thread_idx, 0, &V_regs[0]);
                 }
 #endif
                 
@@ -2145,11 +2437,11 @@ struct CollectiveMainloopFwdSm80 {
                         }
 #else
                         if constexpr (UseSM80MMA) {
-                            flash::copy_V_smem_to_regs_manual_transposed<kHeadDim, kBlockN>(
-                                smem_V_stage_ptr, thread_idx, k_block + 1, tCrV_copy_view(_, _, k_block + 1));
+                            flash::copy_V_smem_to_raw_regs_transposed<kHeadDim, kHeadDimV>(
+                                smem_V_stage_ptr, thread_idx, k_block + 1, &V_regs[(k_block + 1) * RegsPerKBlockV]);
                         } else {
-                            flash::copy_V_smem_to_regs_manual_transposed_x2<kHeadDim, kBlockN>(
-                                smem_V_stage_ptr, thread_idx, k_block + 1, tCrV_copy_view(_, _, k_block + 1));
+                            flash::copy_V_smem_to_raw_regs_transposed_x2<kHeadDim, kHeadDimV>(
+                                smem_V_stage_ptr, thread_idx, k_block + 1, &V_regs[(k_block + 1) * RegsPerKBlockV]);
                         }
 #endif
                     }
@@ -2181,7 +2473,49 @@ struct CollectiveMainloopFwdSm80 {
                     //    printf("=====================================\n\n");
                     //}
                     
+#if FLASH_USE_CUTLASS_TENSOR
                     cute::gemm(tiled_mma, tOrP(_, _, k_block), tOrV(_, _, k_block), tOrO);
+#else
+                    // Manual P×V GEMM with raw V registers.
+                    // Same structure as the Q×K^T manual GEMM (see FLASH_MANUAL_GEMM above):
+                    // iterate over M and N atom steps with serpentine ordering, then call MMA.
+                    {
+                        // M = number of MMA-atom steps in M (same as Q×K^T GEMM).
+                        int const M_pv = size<1>(tOrP);
+                        // N = number of MMA-atom steps in N (headdimV / atom_N).
+                        static constexpr int N_pv = NAtomsV;
+                        #pragma unroll
+                        for (int m = 0; m < M_pv; ++m) {
+                            #pragma unroll
+                            for (int n = 0; n < N_pv; ++n) {
+                                int const ns = (m & 1) ? (N_pv - 1 - n) : n;  // serpentine
+                                using MMA_Op = typename TiledMma::Atom::MMA_Op;
+                                using RegTypeD = typename std::remove_extent<typename MMA_Op::DRegisters>::type;
+                                using RegTypeA = typename std::remove_extent<typename MMA_Op::ARegisters>::type;
+                                using RegTypeB = typename std::remove_extent<typename MMA_Op::BRegisters>::type;
+                                using RegTypeC = typename std::remove_extent<typename MMA_Op::CRegisters>::type;
+                                constexpr int RegNumD = std::extent<typename MMA_Op::DRegisters>::value;
+                                constexpr int RegNumA = std::extent<typename MMA_Op::ARegisters>::value;
+                                constexpr int RegNumB = std::extent<typename MMA_Op::BRegisters>::value;
+                                constexpr int RegNumC = std::extent<typename MMA_Op::CRegisters>::value;
+                                auto D_slice = tOrO(_, m, ns);
+                                auto A_slice = tOrP(_, m, k_block);
+                                auto C_slice = tOrO(_, m, ns);
+                                auto rD = recast<RegTypeD>(D_slice);
+                                auto rA = recast<RegTypeA>(A_slice);
+                                // Raw V register access (same layout as K — see K GEMM above).
+                                flash::RawRegs<RegTypeB, RegNumB> rB{reinterpret_cast<RegTypeB*>(
+                                    &V_regs[k_block * RegsPerKBlockV + ns * VRegsPerAtomV])};
+                                auto rC = recast<RegTypeC>(C_slice);
+                                cute::detail::explode(MMA_Op::fma,
+                                    rD, cute::make_int_sequence<RegNumD>{},
+                                    rA, cute::make_int_sequence<RegNumA>{},
+                                    rB, cute::make_int_sequence<RegNumB>{},
+                                    rC, cute::make_int_sequence<RegNumC>{});
+                            }
+                        }
+                    }
+#endif
                 }
             }
             // ============================================================================
