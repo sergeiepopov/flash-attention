@@ -2384,11 +2384,8 @@ struct CollectiveMainloopFwdSm80 {
             static constexpr int NAtomsN_S = kBlockN / 8;                // N-atoms (atom_N=8)
             static constexpr int TotalSRegs = NAtomsM_S * NAtomsN_S * VRegsPerAtomS;
             float S_regs[TotalSRegs];
-            // CuTe tensor view over S_regs with LayoutLeft layout from partition_fragment_C.
-            // Used by mask/softmax/P-conversion functions that require CuTe tensor interface.
-            auto tSrS = make_tensor(static_cast<float*>(S_regs),
-                partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{})).layout());
-            clear(tSrS);
+            #pragma unroll
+            for (int i = 0; i < TotalSRegs; ++i) S_regs[i] = 0.f;
 #endif
             sync();
             auto load_V_next = [&] {
@@ -2796,13 +2793,17 @@ struct CollectiveMainloopFwdSm80 {
                                     rB, cute::make_int_sequence<RegNumB>{},
                                     rC, cute::make_int_sequence<RegNumC>{});
 #else
+#if FLASH_USE_CUTLASS_TENSOR
                                 tiled_mma.call(tSrS(_, m, ns), tSrQ_cur(_, m, k_block), tSrK(_, ns, k_block), tSrS(_, m, ns));
+#endif
 #endif
                             }
                         }
                     }
 #else
+#if FLASH_USE_CUTLASS_TENSOR
                     cute::gemm(tiled_mma, tSrQ_cur(_, _, k_block), tSrK(_, _, k_block), tSrS);
+#endif
 #endif
                     // After this instruction, tSrS accumulates: S += Q_k × K_k^T
                     // The accumulator is in fp32 for numerical precision
