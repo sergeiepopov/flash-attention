@@ -1681,8 +1681,6 @@ struct CollectiveMainloopFwdSm80 {
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
-        //printf("%d %d %d %d\n", get<0>(params.shape_Q_packed), get<1>(params.shape_Q_packed), get<2>(params.shape_Q_packed), get<3>(params.shape_Q_packed));
-
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
         auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
         auto gmem_thr0_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(_0{});  // For index calculation
@@ -1786,7 +1784,7 @@ struct CollectiveMainloopFwdSm80 {
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
                 gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
             );
-#elif 0
+#elif FLASH_USE_CUTLASS_TENSOR
             // ============================================================================
             // MANUAL REWRITE - What it does under the hood:
             // ============================================================================
@@ -1803,16 +1801,6 @@ struct CollectiveMainloopFwdSm80 {
             int const num_vec_copies = size<0>(tQgQ);  // e.g., 2
             int const num_m_elements = size<1>(tQgQ);  // e.g., 4  
             int const num_k_elements = size<2>(tQgQ);  // e.g., 8
-
-            //printf("%d %d %d %d %d %d %d\n", num_vec_copies, num_m_elements, num_k_elements, (int)size<0>(tKgK), (int)size<1>(tKgK), (int)size<2>(tKgK), (int)size<3>(tKgK));
-            if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
-            {
-                printf("seqlen_k = %d\n", seqlen_info.seqlen_k);
-                printf("kHeadDim = %d\n", kHeadDim);
-                printf("kGmemElemsPerLoad = %d\n", kGmemElemsPerLoad);
-                printf("kBlockN = %d, kBlockK = %d\n", kBlockN, kHeadDim);
-                printf("num K blocks = %d\n", (seqlen_info.seqlen_k + kBlockN - 1) / kBlockN);
-			}
 
             // Step 3: Triple nested loop with bounds checking
             #pragma unroll
@@ -1968,7 +1956,7 @@ struct CollectiveMainloopFwdSm80 {
             //if constexpr (!PagedKV) {
                 // Do we need bound check to make sure the row doesn't go above kBlockN
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
-            #if 0
+            #if FLASH_USE_CUTLASS_TENSOR
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);
                 // Instead of passing in tKVcKV, we pass in t0KVcKV and subtract the offset from the limit
                 // (seqlen_k - n_block * kBlockN). This is because the entries of t0KVcKV are known at compile time.
@@ -2010,22 +1998,27 @@ struct CollectiveMainloopFwdSm80 {
                 constexpr bool Clear_OOB_MN = false;                  // Don't zero invalid N rows (will mask in scores)
                 constexpr bool Clear_OOB_K = true;                    // DO zero invalid K columns (prevent garbage)
 
-                // Step 4: Get tensor dimensions
-                int const num_vec_copies = size<0>(tKgK_cur);
-                int const num_n_elements = size<1>(tKgK_cur);
-                int const num_k_elements = size<2>(tKgK_cur);
-                #if 0
-                int const stride_v_K = static_cast<int>(tKgK.layout()(1, 0, 0, 0));
-                int const stride_m_K = static_cast<int>(tKgK.layout()(0, 1, 0, 0));
-                int const stride_k_K = static_cast<int>(tKgK.layout()(0, 0, 1, 0));
-                #else
+                // Step 4: Get tensor dimensions (compile-time constants from GmemTiledCopyQKV partition)
+                //   vec:  kGmemElemsPerLoad elements per 128-bit vectorized load
+                //   n:    kBlockN / thread_rows rows assigned to this thread
+                //   k:    kHeadDim / kBlockKGmem K-chunks across head dimension
+                // CuTe tensor equivalent:
+                //   int const num_vec_copies = size<0>(tKgK_cur);
+                //   int const num_n_elements = size<1>(tKgK_cur);
+                //   int const num_k_elements = size<2>(tKgK_cur);
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;
+                static constexpr int num_n_elements = kBlockN / thread_rows;
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
+                // CuTe tensor equivalent:
+                //   int const stride_v_K = static_cast<int>(tKgK.layout()(1, 0, 0, 0));
+                //   int const stride_m_K = static_cast<int>(tKgK.layout()(0, 1, 0, 0));
+                //   int const stride_k_K = static_cast<int>(tKgK.layout()(0, 0, 1, 0));
                 int const k_row_stride = static_cast<int>(get<0>(params.stride_K));  // from params
 
                 int const stride_v_K  = 1;
                 int const stride_m_K  = thread_rows * k_row_stride;
                 // stride_k_gmem only matters if num_k_elements > 1:
                 int const stride_k_K  = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
-                #endif
                 int const num_n_per_thread = kBlockN / thread_rows;
                 int const stride_sv_K = 1;
                 int const stride_sn_K = kGmemThreadsPerRow;
@@ -2692,39 +2685,6 @@ struct CollectiveMainloopFwdSm80 {
                     // The tiled_mma handles multiple MMA instructions to cover the full
                     // tile size (e.g., 64x64 tile = multiple 16x8x16 MMAs)
                     
-                    // ================================================================
-                    // DEBUG: Print MMA sizes (only from thread 0, block 0, first iter)
-                    // ================================================================
-                    //if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
-                    //    // TileShape from template parameters
-                    //    printf("\n========== MMA SIZE DEBUG ==========\n");
-                    //    printf("TileShape_MNK: M=%d, N=%d, K=%d\n", 
-                    //           kBlockM, kBlockN, kHeadDim);
-                    //    
-                    //    // TiledMma shape: Tile<M, N, K> using tile_shape() function
-                    //    auto mma_tile = tile_shape(tiled_mma);
-                    //    printf("TiledMma Tile Shape: M=%d, N=%d, K=%d\n",
-                    //           int(size<0>(mma_tile)),
-                    //           int(size<1>(mma_tile)),
-                    //           int(size<2>(mma_tile)));
-                    //    
-                    //    // Number of threads
-                    //    printf("NumMmaThreads: %d (kNWarps=%d)\n", NumMmaThreads, kNWarps);
-                    //    
-                    //    // Fragment shapes (per thread)
-                    //    printf("tSrQ_cur shape: (%d, %d, %d)\n",
-                    //           int(size<0>(tSrQ_cur)), int(size<1>(tSrQ_cur)), int(size<2>(tSrQ_cur)));
-                    //    printf("tSrK shape: (%d, %d, %d)\n",
-                    //           int(size<0>(tSrK)), int(size<1>(tSrK)), int(size<2>(tSrK)));
-                    //    printf("tSrS shape: (%d, %d, %d)\n",
-                    //           int(size<0>(tSrS)), int(size<1>(tSrS)), int(size<2>(tSrS)));
-                    //    
-                    //    // MMA Atom info
-                    //    printf("MMA Atom: %s\n", UseSM80MMA ? "SM80_16x8x16_F32F16F16F32_TN" : "SM75_16x8x8_F32F16F16F32_TN");
-                    //    printf("PTX: %s\n", UseSM80MMA ? "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32" : "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32");
-                    //    printf("====================================\n\n");
-                    //}
-                    
 #ifdef FLASH_MANUAL_GEMM
                     // Manual GEMM: same instruction as cute::gemm (mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 or m16n8k8).
                     // cute::gemm(tiled_mma, A, B, C) with A(V,M,K), B(V,N,K), C(V,M,N) does: for k, then for m,n serpentine, call mma(D, A(_,m,k), B(_,n,k), C).
@@ -3054,20 +3014,6 @@ struct CollectiveMainloopFwdSm80 {
                     //   O = Σ_k (P_k × V_k)
                     //
                     // This is the weighted sum of values, where weights are attention probs
-                    
-                    // ================================================================
-                    // DEBUG: Print P×V GEMM sizes (only once)
-                    // ================================================================
-                    //if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && k_block == 0 && n_block == n_block_max - 1) {
-                    //    printf("\n========== P×V GEMM DEBUG ==========\n");
-                    //    printf("tOrP shape: (%d, %d, %d)\n",
-                    //           int(size<0>(tOrP)), int(size<1>(tOrP)), int(size<2>(tOrP)));
-                    //    printf("tOrV shape: (%d, %d, %d)\n",
-                    //           int(size<0>(tOrV)), int(size<1>(tOrV)), int(size<2>(tOrV)));
-                    //    printf("tOrO shape: (%d, %d, %d)\n",
-                    //           int(size<0>(tOrO)), int(size<1>(tOrO)), int(size<2>(tOrO)));
-                    //    printf("=====================================\n\n");
-                    //}
                     
 #if FLASH_USE_CUTLASS_TENSOR
                     cute::gemm(tiled_mma, tOrP(_, _, k_block), tOrV(_, _, k_block), tOrO);
