@@ -2130,24 +2130,29 @@ struct CollectiveMainloopFwdSm80 {
                 // ============================================================================
 
                 // Step 1: Extract current V tile for this n_block and pipeline stage
+#if FLASH_USE_CUTLASS_TENSOR
                 Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_write);
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
+#endif
 
                 // Step 2: Calculate how many valid rows in this V block
-                int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
+                // CuTe: get<0>(tKVcKV(_0{}, _0{}, _0{})) = thread's first N-row in the partition
+                int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN
+                    - int(thread_idx / kGmemThreadsPerRow);
 
                 // Step 3: Dimensions (same partition as K: same GmemTiledCopyQKV, same tile shape)
-                int const num_vec_copies = size<0>(tVsV_cur);
-                int const num_n_elements = size<1>(tVsV_cur);
-                int const num_k_elements = size<2>(tVsV_cur);
+                // CuTe: size<0>(tVsV_cur), size<1>(tVsV_cur), size<2>(tVsV_cur)
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;
+                static constexpr int num_n_elements = kBlockN / thread_rows;
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
 
 #if !FLASH_USE_CUTLASS_TENSOR
                 // Manual address calculation for V (no cutlass tensor indexing)
                 int const v_row_stride = static_cast<int>(get<0>(params.stride_V));
-                // gmem partition strides: vec is contiguous, n jumps thread_rows gmem rows
-                int const stride_v_V   = 1;
-                int const stride_n_V   = thread_rows * v_row_stride;
-                int const stride_k_V   = kBlockKGmem;
+                // Gmem strides (CuTe: tVgV.layout()(1,0,0,0), (0,1,0,0), (0,0,1,0)):
+                int const stride_v_V   = static_cast<int>(tVgV.layout()(1, 0, 0, 0));
+                int const stride_n_V   = static_cast<int>(tVgV.layout()(0, 1, 0, 0));
+                int const stride_k_V   = static_cast<int>(tVgV.layout()(0, 0, 1, 0));
                 // gmem thread base: (thread_row * row_stride_gmem) + (thread_col * kGmemElemsPerLoad)
                 int const thread_base_gmem_V = (thread_idx / kGmemThreadsPerRow) * v_row_stride
                                              + (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad;
