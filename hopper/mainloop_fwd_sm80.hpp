@@ -2825,12 +2825,17 @@ struct CollectiveMainloopFwdSm80 {
                 sync();
                 load_K_next();
             //}
+            // K-blocks for P×V GEMM = kBlockN / MMA_atom_K.
+            // Equals size<2>(tOrP) in CuTe path; defined here in common code for both paths.
+            static constexpr int KBlocksPV = kBlockN / (UseSM80MMA ? 16 : 8);
 #if FLASH_USE_CUTLASS_TENSOR
             mask_fn(tSrS, n_block);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             //if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+            convert_type_out(tOrP_acc, tOrP);
 #else
             // Raw-register mask: lambda calls apply_mask_raw_regs directly on S_regs.
             mask_fn(S_regs, n_block);
@@ -2845,11 +2850,59 @@ struct CollectiveMainloopFwdSm80 {
                 S_regs, softmax.row_max.data(), softmax.row_sum.data(),
                 softmax.softmax_scale_log2);
             //if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
-            // P-conversion still needs the CuTe layout for Aregs conversion.
-            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+            // Raw P register conversion: convert fp32 S accumulator to fp16 packed as uint32_t.
+            // These serve as the A operand for the P×V GEMM.
+            //
+            // SM80 (m16n8k16): convert_layout_acc_Aregs groups pairs of N-atoms into k-blocks.
+            //   Aregs shape: ((4,2), NAtomsM, NAtomsN_S/2)
+            //   Strides:     ((1, 4*NAtomsM_S), 4, 8*NAtomsM_S)
+            //   Source: S_regs[(v%4) + m*4 + (v/4 + 2*k)*4*NAtomsM_S]
+            //   8 fp32 → 8 fp16 → 4 uint32_t per (m, k) MMA A-operand.
+            //
+            // SM75 (m16n8k8): Aregs layout is unchanged from accumulator layout.
+            //   Shape: (4, NAtomsM, NAtomsN_S), Strides: (1, 4, 4*NAtomsM_S)
+            //   Source: S_regs[v + m*4 + k*4*NAtomsM_S]
+            //   4 fp32 → 4 fp16 → 2 uint32_t per (m, k) MMA A-operand.
+            static constexpr int PRegsPerAtom = UseSM80MMA ? 4 : 2;
+            uint32_t P_regs[NAtomsM_S * KBlocksPV * PRegsPerAtom];
+            {
+                if constexpr (UseSM80MMA) {
+                    static constexpr int ElemsPerAtom = 8;
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_S; ++m) {
+                        #pragma unroll
+                        for (int k = 0; k < KBlocksPV; ++k) {
+                            cutlass::Array<float, ElemsPerAtom> src;
+                            #pragma unroll
+                            for (int v = 0; v < ElemsPerAtom; ++v) {
+                                src[v] = S_regs[(v % 4) + m * 4 + (v / 4 + 2 * k) * 4 * NAtomsM_S];
+                            }
+                            cutlass::NumericArrayConverter<Element, float, ElemsPerAtom> cvt;
+                            auto dst = cvt(src);
+                            memcpy(&P_regs[m * KBlocksPV * PRegsPerAtom + k * PRegsPerAtom],
+                                   &dst, PRegsPerAtom * sizeof(uint32_t));
+                        }
+                    }
+                } else {
+                    static constexpr int ElemsPerAtom = 4;
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_S; ++m) {
+                        #pragma unroll
+                        for (int k = 0; k < KBlocksPV; ++k) {
+                            cutlass::Array<float, ElemsPerAtom> src;
+                            #pragma unroll
+                            for (int v = 0; v < ElemsPerAtom; ++v) {
+                                src[v] = S_regs[v + m * 4 + k * 4 * NAtomsM_S];
+                            }
+                            cutlass::NumericArrayConverter<Element, float, ElemsPerAtom> cvt;
+                            auto dst = cvt(src);
+                            memcpy(&P_regs[m * KBlocksPV * PRegsPerAtom + k * PRegsPerAtom],
+                                   &dst, PRegsPerAtom * sizeof(uint32_t));
+                        }
+                    }
+                }
+            }
 #endif
-            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
-            convert_type_out(tOrP_acc, tOrP);
             if constexpr (!Is_first_iter)
             {
 #if FLASH_USE_CUTLASS_TENSOR
@@ -2955,12 +3008,20 @@ struct CollectiveMainloopFwdSm80 {
                 // ========================================================================
                 // Similar pipelining as gemm_sm80, but simpler since P is already in regs
                 #pragma unroll
+#if FLASH_USE_CUTLASS_TENSOR
                 for (int k_block = 0; k_block < size<2>(tOrP); ++k_block) {
+#else
+                for (int k_block = 0; k_block < KBlocksPV; ++k_block) {
+#endif
                     
                     // --------------------------------------------------------------------
                     // PREFETCH: Load NEXT k-slice of V while current MMA executes
                     // --------------------------------------------------------------------
+#if FLASH_USE_CUTLASS_TENSOR
                     if (k_block < size<2>(tOrP) - 1) {
+#else
+                    if (k_block < KBlocksPV - 1) {
+#endif
 #if FLASH_USE_CUTLASS_TENSOR
                         if constexpr (UseSM80MMA) {
                             flash::educational_copy_smem_to_regs_transposed(
@@ -3015,7 +3076,11 @@ struct CollectiveMainloopFwdSm80 {
                     // iterate over M and N atom steps with serpentine ordering, then call MMA.
                     {
                         // M = number of MMA-atom steps in M (same as Q×K^T GEMM).
+#if FLASH_USE_CUTLASS_TENSOR
                         int const M_pv = size<1>(tOrP);
+#else
+                        static constexpr int M_pv = NAtomsM_S;
+#endif
                         // N = number of MMA-atom steps in N (headdimV / atom_N).
                         static constexpr int N_pv = NAtomsV;
                         #pragma unroll
@@ -3038,8 +3103,9 @@ struct CollectiveMainloopFwdSm80 {
                                     &O_regs[m * VRegsPerAtomO + ns * VRegsPerAtomO * NAtomsM_O]};
                                 flash::RawRegs<RegTypeC, RegNumC> rC{
                                     &O_regs[m * VRegsPerAtomO + ns * VRegsPerAtomO * NAtomsM_O]};
-                                auto A_slice = tOrP(_, m, k_block);
-                                auto rA = recast<RegTypeA>(A_slice);
+                                // Raw P register access: contiguous PRegsPerAtom uint32_t per (m, k_block).
+                                flash::RawRegs<RegTypeA, RegNumA> rA{
+                                    &P_regs[m * KBlocksPV * PRegsPerAtom + k_block * PRegsPerAtom]};
                                 // Raw V register access (same layout as K — see K GEMM above).
                                 flash::RawRegs<RegTypeB, RegNumB> rB{reinterpret_cast<RegTypeB*>(
                                     &V_regs[k_block * RegsPerKBlockV + ns * VRegsPerAtomV])};
