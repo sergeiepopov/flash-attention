@@ -1179,6 +1179,164 @@ CUTLASS_DEVICE void apply_mask_raw_regs(
     }
 }
 
+// ============================================================================
+// Raw-register version of Softmax::max_get_scale.
+//
+// Operates directly on the flat S_regs array using the same rowcol index
+// mapping as apply_mask_raw_regs.  Row-wise max is reduced across 4 threads
+// via __shfl_xor_sync (Allreduce<4> butterfly), matching CuTe's quad_allreduce_.
+//
+// Parameters:
+//   S_regs          – attention scores (read-only here)
+//   row_max         – [kNRows] per-row running maximum (updated in-place)
+//   row_sum         – [kNRows] per-row running sum (scaled on non-first iter)
+//   scores_scale    – [kNRows] output: scale factors for rescale_o
+//   softmax_scale_log2 – log2(softmax_scale), pre-multiplied
+// ============================================================================
+template <bool Is_first, bool Check_inf,
+          int NAtomsM_, int NAtomsN_>
+CUTLASS_DEVICE void max_get_scale_raw_regs(
+    float const* S_regs,
+    float* row_max,
+    float* row_sum,
+    float* scores_scale,
+    float softmax_scale_log2)
+{
+    static constexpr int kVRegsPerAtom = 4;
+    static constexpr int kNRows = 2 * NAtomsM_;
+    static constexpr int kNCols = 2 * NAtomsN_;
+
+    // rowcol (row, col) → flat S_regs offset  (same mapping as mask).
+    auto s_idx = [](int row, int col) -> int {
+        return (col & 1) + (row & 1) * 2
+             + (row >> 1) * kVRegsPerAtom
+             + (col >> 1) * kVRegsPerAtom * NAtomsM_;
+    };
+
+    if constexpr (Is_first) {
+        // First iteration: compute row_max from scratch, scores_scale = 1.
+        #pragma unroll
+        for (int row = 0; row < kNRows; ++row) {
+            float mx = S_regs[s_idx(row, 0)];
+            #pragma unroll
+            for (int col = 1; col < kNCols; ++col) {
+                mx = fmaxf(mx, S_regs[s_idx(row, col)]);
+            }
+            // Allreduce<4> butterfly: reduce across 4 threads sharing this row.
+            mx = fmaxf(mx, __shfl_xor_sync(uint32_t(-1), mx, 2));
+            mx = fmaxf(mx, __shfl_xor_sync(uint32_t(-1), mx, 1));
+            row_max[row] = mx;
+            scores_scale[row] = 1.f;
+        }
+    } else {
+        // Subsequent iterations: update row_max, compute scale, adjust row_sum.
+        #pragma unroll
+        for (int row = 0; row < kNRows; ++row) {
+            float const prev_max = row_max[row];
+            float mx = prev_max;                    // start from previous max
+            #pragma unroll
+            for (int col = 0; col < kNCols; ++col) {
+                mx = fmaxf(mx, S_regs[s_idx(row, col)]);
+            }
+            // Allreduce<4> butterfly.
+            mx = fmaxf(mx, __shfl_xor_sync(uint32_t(-1), mx, 2));
+            mx = fmaxf(mx, __shfl_xor_sync(uint32_t(-1), mx, 1));
+            row_max[row] = mx;
+
+            float const cur_max = !Check_inf
+                ? mx
+                : (mx == -INFINITY ? 0.0f : mx);
+            scores_scale[row] = exp2f((prev_max - cur_max) * softmax_scale_log2);
+            row_sum[row] *= scores_scale[row];
+        }
+    }
+}
+
+// ============================================================================
+// Raw-register version of Softmax::online_softmax.
+//
+// Applies exp2 scaling to each element of S_regs in-place, then accumulates
+// the per-row sum (thread-local only, no warp reduction – that happens in
+// finalize).
+//
+// score = exp2f(score * softmax_scale_log2 - max_scaled)
+//
+// where max_scaled = row_max * softmax_scale_log2 - Max_offset
+//       (with -inf guard when Check_inf is true).
+// ============================================================================
+template <bool Is_first, bool Check_inf, int Max_offset,
+          int NAtomsM_, int NAtomsN_>
+CUTLASS_DEVICE void online_softmax_raw_regs(
+    float* S_regs,
+    float const* row_max,
+    float* row_sum,
+    float softmax_scale_log2)
+{
+    static constexpr int kVRegsPerAtom = 4;
+    static constexpr int kNRows = 2 * NAtomsM_;
+    static constexpr int kNCols = 2 * NAtomsN_;
+    static constexpr float max_offset = float(Max_offset);
+
+    auto s_idx = [](int row, int col) -> int {
+        return (col & 1) + (row & 1) * 2
+             + (row >> 1) * kVRegsPerAtom
+             + (col >> 1) * kVRegsPerAtom * NAtomsM_;
+    };
+
+    #pragma unroll
+    for (int row = 0; row < kNRows; ++row) {
+        // Compute scaled max for this row (matches scale_apply_exp2).
+        float const max_scaled = Check_inf
+            ? (row_max[row] == -INFINITY ? 0.f : row_max[row] * softmax_scale_log2 - max_offset)
+            : row_max[row] * softmax_scale_log2 - max_offset;
+
+        // Apply exp2 to each element, accumulate row sum (thread-local).
+        float sum = Is_first ? 0.f : row_sum[row];
+        #pragma unroll
+        for (int col = 0; col < kNCols; ++col) {
+            int const idx = s_idx(row, col);
+            S_regs[idx] = exp2f(S_regs[idx] * softmax_scale_log2 - max_scaled);
+            sum += S_regs[idx];
+        }
+        row_sum[row] = sum;
+    }
+}
+
+// ============================================================================
+// Raw-register version of Softmax::rescale_o.
+//
+// Rescales the O accumulator (output registers) by per-row scores_scale
+// factors.  Uses the same rowcol index mapping as the S accumulator, but
+// parameterized on NAtomsN_O (= kHeadDimV / 8) instead of NAtomsN_S.
+//
+// O_regs layout (LayoutLeft from partition_fragment_C):
+//   flat index = (col & 1) + (row & 1) * 2 + (row / 2) * 4 + (col / 2) * 4 * NAtomsM_
+// ============================================================================
+template <int NAtomsM_, int NAtomsN_>
+CUTLASS_DEVICE void rescale_o_raw_regs(
+    float* O_regs,
+    float const* scores_scale)
+{
+    static constexpr int kVRegsPerAtom = 4;
+    static constexpr int kNRows = 2 * NAtomsM_;
+    static constexpr int kNCols = 2 * NAtomsN_;
+
+    auto o_idx = [](int row, int col) -> int {
+        return (col & 1) + (row & 1) * 2
+             + (row >> 1) * kVRegsPerAtom
+             + (col >> 1) * kVRegsPerAtom * NAtomsM_;
+    };
+
+    #pragma unroll
+    for (int row = 0; row < kNRows; ++row) {
+        float const scale = scores_scale[row];
+        #pragma unroll
+        for (int col = 0; col < kNCols; ++col) {
+            O_regs[o_idx(row, col)] *= scale;
+        }
+    }
+}
+
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
         bool PackGQA_, bool Split_>
@@ -2183,7 +2341,19 @@ struct CollectiveMainloopFwdSm80 {
             __syncthreads();
         };
 
+#if FLASH_USE_CUTLASS_TENSOR
         clear(tOrO);
+#else
+        // O accumulator as raw float pointer, aliasing tOrO's internal storage.
+        // All raw operations modify tOrO's data directly (no copy needed for epilogue).
+        static constexpr int NAtomsM_O = kBlockM / (16 * kNWarps);
+        static constexpr int NAtomsN_O = kHeadDimV / 8;
+        static constexpr int VRegsPerAtomO = 4;
+        static constexpr int TotalORegs = VRegsPerAtomO * NAtomsM_O * NAtomsN_O;
+        float* O_regs = tOrO.data();
+        #pragma unroll
+        for (int i = 0; i < TotalORegs; ++i) O_regs[i] = 0.f;
+#endif
 
         auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
             static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
@@ -2664,18 +2834,29 @@ struct CollectiveMainloopFwdSm80 {
 #else
             // Raw-register mask: lambda calls apply_mask_raw_regs directly on S_regs.
             mask_fn(S_regs, n_block);
-            // Softmax and P-conversion still require CuTe tensor views.
-            // tSrS (declared above) is already a view over S_regs with the correct layout.
-            Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
-            softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+            // Raw-register softmax: operates directly on S_regs without CuTe tensors.
+            // scores_scale stored as a small float array (kNRows elements).
+            float scores_scale_raw[2 * NAtomsM_S];
+            flash::max_get_scale_raw_regs<Is_first_iter, Check_inf, NAtomsM_S, NAtomsN_S>(
+                S_regs, softmax.row_max.data(), softmax.row_sum.data(),
+                scores_scale_raw, softmax.softmax_scale_log2);
+            static constexpr int Softmax_max_offset = Is_FP8 ? 8 : 0;
+            flash::online_softmax_raw_regs<Is_first_iter, Check_inf, Softmax_max_offset, NAtomsM_S, NAtomsN_S>(
+                S_regs, softmax.row_max.data(), softmax.row_sum.data(),
+                softmax.softmax_scale_log2);
             //if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+            // P-conversion still needs the CuTe layout for Aregs conversion.
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
 #endif
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
             if constexpr (!Is_first_iter)
             {
+#if FLASH_USE_CUTLASS_TENSOR
                 softmax.rescale_o(tOrO, scores_scale);
+#else
+                flash::rescale_o_raw_regs<NAtomsM_O, NAtomsN_O>(O_regs, scores_scale_raw);
+#endif
             }
             //if constexpr (kStages > 1)
             //{
@@ -2851,15 +3032,17 @@ struct CollectiveMainloopFwdSm80 {
                                 constexpr int RegNumA = std::extent<typename MMA_Op::ARegisters>::value;
                                 constexpr int RegNumB = std::extent<typename MMA_Op::BRegisters>::value;
                                 constexpr int RegNumC = std::extent<typename MMA_Op::CRegisters>::value;
-                                auto D_slice = tOrO(_, m, ns);
+                                // Raw O accumulator D/C: LayoutLeft (M-inner, N-outer), same as S.
+                                // Offset = m * 4 + ns * 4 * NAtomsM_O.
+                                flash::RawRegs<RegTypeD, RegNumD> rD{
+                                    &O_regs[m * VRegsPerAtomO + ns * VRegsPerAtomO * NAtomsM_O]};
+                                flash::RawRegs<RegTypeC, RegNumC> rC{
+                                    &O_regs[m * VRegsPerAtomO + ns * VRegsPerAtomO * NAtomsM_O]};
                                 auto A_slice = tOrP(_, m, k_block);
-                                auto C_slice = tOrO(_, m, ns);
-                                auto rD = recast<RegTypeD>(D_slice);
                                 auto rA = recast<RegTypeA>(A_slice);
                                 // Raw V register access (same layout as K — see K GEMM above).
                                 flash::RawRegs<RegTypeB, RegNumB> rB{reinterpret_cast<RegTypeB*>(
                                     &V_regs[k_block * RegsPerKBlockV + ns * VRegsPerAtomV])};
-                                auto rC = recast<RegTypeC>(C_slice);
                                 cute::detail::explode(MMA_Op::fma,
                                     rD, cute::make_int_sequence<RegNumD>{},
                                     rA, cute::make_int_sequence<RegNumA>{},
@@ -2951,7 +3134,11 @@ struct CollectiveMainloopFwdSm80 {
         //}
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax.finalize(v_descale);
+#if FLASH_USE_CUTLASS_TENSOR
         softmax.rescale_o(tOrO, scores_scale);
+#else
+        flash::rescale_o_raw_regs<NAtomsM_O, NAtomsN_O>(O_regs, scores_scale.data());
+#endif
         //if constexpr (Is_FP8)
         //{
         //    flash::permute_output_fp8(tOrO);
