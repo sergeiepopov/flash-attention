@@ -2015,11 +2015,14 @@ struct CollectiveMainloopFwdSm80 {
                 //   int const stride_k_K = static_cast<int>(tKgK.layout()(0, 0, 1, 0));
                 int const k_row_stride = static_cast<int>(get<0>(params.stride_K));  // from params
 
+                // Gmem strides (CuTe: tKgK.layout()(1,0,0,0), (0,1,0,0), (0,0,1,0)):
                 int const stride_v_K  = 1;
                 int const stride_m_K  = thread_rows * k_row_stride;
                 // stride_k_gmem only matters if num_k_elements > 1:
                 int const stride_k_K  = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
+                // CuTe: size<1>(tKgK_cur)
                 int const num_n_per_thread = kBlockN / thread_rows;
+                // Smem strides (CuTe: tKsK_cur.layout()(1,0,0), (0,1,0), (0,0,1)):
                 int const stride_sv_K = 1;
                 int const stride_sn_K = kGmemThreadsPerRow;
                 int const stride_sk_K = kGmemThreadsPerRow * num_n_per_thread;
