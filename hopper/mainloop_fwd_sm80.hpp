@@ -1022,6 +1022,163 @@ CUTLASS_DEVICE void copy_V_smem_to_raw_regs_transposed_x2(
 //
 // ============================================================================
 
+// ============================================================================
+// Raw-register version of Mask::apply for forward pass (non-SwapAB).
+//
+// Operates directly on the flat S_regs float array without CuTe tensors.
+// Replaces the CuTe-based coordinate mapping (partition_C on identity tensor,
+// convert_layout_acc_rowcol) with explicit address arithmetic derived from
+// the SM80 m16n8 MMA atom's C/D register layout.
+//
+// S_regs layout (LayoutLeft from partition_fragment_C):
+//   flat index = c0 + r0*2 + m*4 + n*4*NAtomsM_
+//   where: r0 = row%2 (0=top half rows 0-7, 1=bottom half rows 8-15 of atom)
+//          m  = row/2  (M-atom index per warp)
+//          c0 = col%2  (0=even column, 1=odd column within atom)
+//          n  = col/2  (N-atom index)
+//
+// Per-thread tile coordinates (SM80 m16n8 atom, non-SwapAB):
+//   lane_id     = thread_idx % 32
+//   warp_id     = thread_idx / 32
+//   groupID     = lane_id / 4    (selects row within atom: rows groupID, groupID+8)
+//   threadInGrp = lane_id % 4    (selects column pair: cols threadInGrp*2, threadInGrp*2+1)
+//
+//   M-position in tile for rowcol row index 'row':
+//     (row/2) * 16*kNWarps_ + warp_id*16 + groupID + (row%2)*8
+//
+//   Thread-0 N-position for rowcol col index 'col':
+//     (col/2) * 8 + (col%2)
+//
+//   thread_col_offset = threadInGrp * 2
+// ============================================================================
+template <bool Seqlenk_mask, bool Causal_mask, bool Local_mask,
+          int kBlockM_, int kBlockN_, int kNWarps_,
+          int NAtomsM_, int NAtomsN_, bool PackGQA_>
+CUTLASS_DEVICE void apply_mask_raw_regs(
+    float* S_regs,
+    int thread_idx,
+    int m_block, int n_block,
+    int seqlen_q, int seqlen_k,
+    int window_size_left, int window_size_right,
+    int sink_token_length,
+    cutlass::FastDivmod const& attention_chunk_divmod,
+    cutlass::FastDivmod const& qhead_per_khead_divmod)
+{
+    static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
+    if constexpr (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
+
+    static constexpr int kVRegsPerAtom = 4;    // float[4] per C/D atom
+    static constexpr int kNRows = 2 * NAtomsM_; // total row indices per thread
+    static constexpr int kNCols = 2 * NAtomsN_; // total col indices per thread
+
+    // SM80 m16n8: 4 threads share each row (same groupID, different threadInGrp).
+    static constexpr int kMmaThreadsPerRow = 4;
+    static_assert(!PackGQA_ || kNRows <= kMmaThreadsPerRow);
+
+    int const lane_id = thread_idx % 32;
+    int const warp_id = thread_idx / 32;
+    int const groupID = lane_id / 4;
+    int const threadInGrp = lane_id % 4;
+
+    // This thread's column offset (= N-position of its first element).
+    int const thread_col_offset = threadInGrp * 2;
+    int const seqlenk_col_limit = seqlen_k - n_block * kBlockN_ - thread_col_offset;
+
+    // rowcol (row, col) → flat S_regs offset.
+    auto s_idx = [](int row, int col) -> int {
+        return (col & 1) + (row & 1) * 2
+             + (row >> 1) * kVRegsPerAtom
+             + (col >> 1) * kVRegsPerAtom * NAtomsM_;
+    };
+
+    // Thread-0 N-position for rowcol col index.
+    auto t0_col = [](int col) -> int {
+        return (col >> 1) * 8 + (col & 1);
+    };
+
+    if constexpr (!Causal_mask && !Local_mask) {
+        // Seqlenk_mask only: mask entire columns beyond seqlen_k.
+        if constexpr (Seqlenk_mask) {
+            #pragma unroll
+            for (int col = 0; col < kNCols; ++col) {
+                if (t0_col(col) >= seqlenk_col_limit) {
+                    #pragma unroll
+                    for (int row = 0; row < kNRows; ++row) {
+                        S_regs[s_idx(row, col)] = -INFINITY;
+                    }
+                }
+            }
+        }
+    } else {
+        // M-position within tile for rowcol row index.
+        auto row_M_pos = [&](int row) -> int {
+            return (row >> 1) * 16 * kNWarps_ + warp_id * 16 + groupID + (row & 1) * 8;
+        };
+
+        // PackGQA: precompute divided row index, then share via warp shuffle.
+        int mma_m_idx;
+        if constexpr (PackGQA_) {
+            int pack_row = thread_idx % kMmaThreadsPerRow;
+            mma_m_idx = qhead_per_khead_divmod.divide(
+                m_block * kBlockM_ + row_M_pos(pack_row));
+        }
+
+        int const causal_row_offset = 1 + seqlen_k - n_block * kBlockN_
+                                        - seqlen_q - thread_col_offset;
+
+        if constexpr (Causal_mask) {
+            #pragma unroll
+            for (int row = 0; row < kNRows; ++row) {
+                int const row_idx = !PackGQA_
+                    ? row_M_pos(row) + m_block * kBlockM_
+                    : __shfl_sync(0xffffffff, mma_m_idx,
+                                  row % kMmaThreadsPerRow, kMmaThreadsPerRow);
+                int const col_limit_right = !Seqlenk_mask
+                    ? row_idx + causal_row_offset
+                    : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
+                #pragma unroll
+                for (int col = 0; col < kNCols; ++col) {
+                    if (t0_col(col) >= col_limit_right) {
+                        S_regs[s_idx(row, col)] = -INFINITY;
+                    }
+                }
+            }
+        } else { // Local_mask
+            int const local_row_offset_right = causal_row_offset + window_size_right;
+            int const local_row_offset_left  = causal_row_offset - 1 - window_size_left;
+            int const col_limit_sink = sink_token_length - n_block * kBlockN_;
+            #pragma unroll
+            for (int row = 0; row < kNRows; ++row) {
+                int const row_idx = !PackGQA_
+                    ? row_M_pos(row) + m_block * kBlockM_
+                    : __shfl_sync(0xffffffff, mma_m_idx,
+                                  row % kMmaThreadsPerRow, kMmaThreadsPerRow);
+                int col_limit_right = !Seqlenk_mask
+                    ? row_idx + local_row_offset_right
+                    : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);
+                int col_limit_left = row_idx + local_row_offset_left;
+                if (attention_chunk_divmod.divisor > 0) {
+                    int col_limit_left_chunk =
+                        flash::round_down(attention_chunk_divmod,
+                                          row_idx + seqlen_k - seqlen_q)
+                        - n_block * kBlockN_ - thread_col_offset;
+                    col_limit_left  = std::max(col_limit_left,  col_limit_left_chunk);
+                    col_limit_right = std::min(col_limit_right,
+                                              col_limit_left_chunk + attention_chunk_divmod.divisor);
+                }
+                #pragma unroll
+                for (int col = 0; col < kNCols; ++col) {
+                    int const col_idx = t0_col(col);
+                    if (col_idx >= col_limit_right ||
+                        (col_idx < col_limit_left && col_idx >= col_limit_sink)) {
+                        S_regs[s_idx(row, col)] = -INFINITY;
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
         bool PackGQA_, bool Split_>
@@ -2498,11 +2655,22 @@ struct CollectiveMainloopFwdSm80 {
                 sync();
                 load_K_next();
             //}
+#if FLASH_USE_CUTLASS_TENSOR
             mask_fn(tSrS, n_block);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             //if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+#else
+            // Raw-register mask: lambda calls apply_mask_raw_regs directly on S_regs.
+            mask_fn(S_regs, n_block);
+            // Softmax and P-conversion still require CuTe tensor views.
+            // tSrS (declared above) is already a view over S_regs with the correct layout.
+            Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+            softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+            //if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+#endif
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
             if constexpr (!Is_first_iter)
@@ -2719,16 +2887,40 @@ struct CollectiveMainloopFwdSm80 {
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };
 
-        auto first_iter_mask_fn = [&](auto& tSrS, int n_block)
+        auto first_iter_mask_fn = [&](auto& tSrS_or_regs, int n_block)
         {
-            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+#if FLASH_USE_CUTLASS_TENSOR
+            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS_or_regs, m_block, n_block);
+#else
+            static constexpr int NAtomsM_mask = kBlockM / (16 * kNWarps);
+            static constexpr int NAtomsN_mask = kBlockN / 8;
+            flash::apply_mask_raw_regs<true /*Seqlenk_mask*/, Is_causal, Is_local,
+                kBlockM, kBlockN, kNWarps, NAtomsM_mask, NAtomsN_mask, PackGQA>(
+                tSrS_or_regs, mask.thread_idx, m_block, n_block,
+                mask.seqlen_q, mask.seqlen_k,
+                mask.window_size_left, mask.window_size_right,
+                mask.sink_token_length,
+                mask.attention_chunk_divmod, mask.qhead_per_khead_divmod);
+#endif
         };
         fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
         --n_block;
         //if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-            auto mask_fn = [&](auto& tSrS, int n_block)
+            auto mask_fn = [&](auto& tSrS_or_regs, int n_block)
             {
-                mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+#if FLASH_USE_CUTLASS_TENSOR
+                mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS_or_regs, m_block, n_block);
+#else
+                static constexpr int NAtomsM_mask = kBlockM / (16 * kNWarps);
+                static constexpr int NAtomsN_mask = kBlockN / 8;
+                flash::apply_mask_raw_regs<false /*Seqlenk_mask*/, Is_causal, Is_local,
+                    kBlockM, kBlockN, kNWarps, NAtomsM_mask, NAtomsN_mask, PackGQA>(
+                    tSrS_or_regs, mask.thread_idx, m_block, n_block,
+                    mask.seqlen_q, mask.seqlen_k,
+                    mask.window_size_left, mask.window_size_right,
+                    mask.sink_token_length,
+                    mask.attention_chunk_divmod, mask.qhead_per_khead_divmod);
+#endif
             };
             int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
                 seqlen_info, m_block, n_block_min, params.window_size_right,
