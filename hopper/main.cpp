@@ -1840,8 +1840,8 @@ int main(int argc, char ** argv) {
     try {
         // Small test parameters
         const int batch_size = 2;
-        const int seqlen_q = 16;
-        const int seqlen_k = 16;
+        const int seqlen_q = 1024;
+        const int seqlen_k = 1024;
         const int num_heads = 4;
         const int head_dim = 64;
 

@@ -1431,7 +1431,7 @@ struct CollectiveMainloopFwdSm80 {
     >, Element>;
 
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
-    static constexpr int thread_rows = NumMmaThreads / kGmemThreadsPerRow;
+    static constexpr int kThreadRows = NumMmaThreads / kGmemThreadsPerRow;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
@@ -1805,26 +1805,24 @@ struct CollectiveMainloopFwdSm80 {
             int const num_k_elements = size<2>(tQgQ);
 #else
             // CuTe: get<0>(tQcQ(_0{}, _0{}, _0{})) = thread's first M-row in partition
-            int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM
-                - int(thread_idx / kGmemThreadsPerRow);
+            int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM - int(thread_idx / kGmemThreadsPerRow);
             // CuTe: size<0/1/2>(tQgQ)
             static constexpr int num_vec_copies = kGmemElemsPerLoad;
-            static constexpr int num_m_elements = kBlockM / thread_rows;
+            static constexpr int num_m_elements = kBlockM / kThreadRows;
             static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
             // Gmem strides (CuTe: tQgQ.layout()(1,0,0), (0,1,0), (0,0,1))
             int const q_row_stride = static_cast<int>(get<0>(params.stride_Q));
             int const stride_v_Q = 1;
-            int const stride_m_Q = thread_rows * thread_rows * q_row_stride;
+            int const stride_m_Q = kThreadRows * q_row_stride;
             int const stride_k_Q = kBlockKGmem;
             // Smem strides (CuTe: tQsQ.layout()(1,0,0), (0,1,0), (0,0,1))
             static constexpr int stride_sv_Q = 1;
-            static constexpr int stride_sm_Q = thread_rows * kHeadDim;
+            static constexpr int stride_sm_Q = kThreadRows * kHeadDim;
             static constexpr int stride_sk_Q = kBlockKGmem;
             // Thread base offsets in gmem/smem partitions
             int const threads_along_k = kGmemThreadsPerRow;
-            int const thread_base_row_stride = (kHeadDim / 2) * kGmemThreadsPerRow;
-            int const thread_base_offset = (thread_idx / threads_along_k) * thread_base_row_stride
-                                         + (thread_idx % threads_along_k) * threads_along_k;
+            int const thread_base_gmem_Q = (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad + (thread_idx / kGmemThreadsPerRow) * q_row_stride;
+            int const thread_base_smem_Q = (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad + (thread_idx / kGmemThreadsPerRow) * kHeadDim;
             Element const* gmem_tile_base = gmem_Q_base;
             Element* smem_tile_base = smem_Q_base;
 #endif
@@ -1835,7 +1833,7 @@ struct CollectiveMainloopFwdSm80 {
 #if FLASH_USE_CUTLASS_TENSOR
                     int m_coord = get<0>(t0QcQ(vec, m, _0{}));
 #else
-                    int m_coord = m * thread_rows;  // CuTe: get<0>(t0QcQ(vec, m, _0{}))
+                    int m_coord = m * kThreadRows;  // CuTe: get<0>(t0QcQ(vec, m, _0{}))
 #endif
                     if (m_coord < max_valid_m) {
                         #pragma unroll
@@ -1847,11 +1845,9 @@ struct CollectiveMainloopFwdSm80 {
                                 tQsQ(vec, m, k) = Element(0);
                             }
 #else
-                            int const smem_idx = thread_idx * threads_along_k
-                                + vec * stride_sv_Q + m * stride_sm_Q + k * stride_sk_Q;
+                            int const smem_idx = thread_base_smem_Q + vec * stride_sv_Q + m * stride_sm_Q + k * stride_sk_Q;
                             if (tQpQ_raw[k]) {  // CuTe: tQpQ(k)
-                                int const gmem_idx = thread_base_offset
-                                    + vec * stride_v_Q + m * stride_m_Q + k * stride_k_Q;
+                                int const gmem_idx = thread_base_gmem_Q + vec * stride_v_Q + m * stride_m_Q + k * stride_k_Q;
                                 smem_tile_base[smem_idx] = gmem_tile_base[gmem_idx];
                             } else {
                                 smem_tile_base[smem_idx] = Element(0);
@@ -1906,9 +1902,9 @@ struct CollectiveMainloopFwdSm80 {
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);  // Select pipeline stage
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);          // Select K block
 #endif
-                // CuTe: raw_pointer_cast(sK.data()), raw_pointer_cast(gK.data())
+                // CuTe: raw_pointer_cast(sK.data()), raw_pointer_cast(gK(_, _, _, n_block).data())
                 Element * smem_tile_base_K = smem_K_base;
-                Element const * gmem_tile_base_K = gmem_K_base;
+                Element const * gmem_tile_base_K = gmem_K_base + n_block * kBlockN * static_cast<int>(get<0>(params.stride_K));
 
                 // Step 2: Calculate the N dimension limit (similar to Q's M limit)
                 // This is more complex than V because it handles the compile-time optimization better
@@ -1932,14 +1928,14 @@ struct CollectiveMainloopFwdSm80 {
 
                 // Step 4: Get tensor dimensions (compile-time constants from GmemTiledCopyQKV partition)
                 //   vec:  kGmemElemsPerLoad elements per 128-bit vectorized load
-                //   n:    kBlockN / thread_rows rows assigned to this thread
+                //   n:    kBlockN / kThreadRows rows assigned to this thread
                 //   k:    kHeadDim / kBlockKGmem K-chunks across head dimension
                 // CuTe tensor equivalent:
                 //   int const num_vec_copies = size<0>(tKgK_cur);
                 //   int const num_n_elements = size<1>(tKgK_cur);
                 //   int const num_k_elements = size<2>(tKgK_cur);
                 static constexpr int num_vec_copies = kGmemElemsPerLoad;
-                static constexpr int num_n_elements = kBlockN / thread_rows;
+                static constexpr int num_n_elements = kBlockN / kThreadRows;
                 static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
                 // CuTe tensor equivalent:
                 //   int const stride_v_K = static_cast<int>(tKgK.layout()(1, 0, 0, 0));
@@ -1949,16 +1945,19 @@ struct CollectiveMainloopFwdSm80 {
 
                 // Gmem strides (CuTe: tKgK.layout()(1,0,0,0), (0,1,0,0), (0,0,1,0)):
                 int const stride_v_K  = 1;
-                int const stride_m_K  = thread_rows * k_row_stride;
+                int const stride_m_K  = kThreadRows * k_row_stride;
                 // stride_k_gmem only matters if num_k_elements > 1:
                 int const stride_k_K  = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
                 // CuTe: size<1>(tKgK_cur)
-                int const num_n_per_thread = kBlockN / thread_rows;
+                int const num_n_per_thread = kBlockN / kThreadRows;
                 // Smem strides (CuTe: tKsK_cur.layout()(1,0,0), (0,1,0), (0,0,1)):
-                int const stride_sv_K = 1;
-                int const stride_sn_K = kGmemThreadsPerRow;
-                int const stride_sk_K = kGmemThreadsPerRow * num_n_per_thread;
-                int const thread_base_offset_K = (thread_idx / kGmemThreadsPerRow) * (kHeadDim / 2) * kGmemThreadsPerRow + (thread_idx % kGmemThreadsPerRow) * kGmemThreadsPerRow;
+                // SmemLayoutK is row-major (kBlockN, kHeadDim) → stride = (kHeadDim, 1)
+                // Partition n-stride = kThreadRows rows * kHeadDim cols per row
+                static constexpr int stride_sv_K = 1;
+                static constexpr int stride_sn_K = kThreadRows * kHeadDim;
+                static constexpr int stride_sk_K = kBlockKGmem;
+                int const thread_base_gmem_K = (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad + (thread_idx / kGmemThreadsPerRow) * k_row_stride;
+                int const thread_base_smem_K = (thread_idx % kGmemThreadsPerRow) * kGmemElemsPerLoad + (thread_idx / kGmemThreadsPerRow) * kHeadDim;
 
                 // Step 5: Triple nested loop with bounds checking
                 #pragma unroll
@@ -1968,8 +1967,8 @@ struct CollectiveMainloopFwdSm80 {
                     for (int n = 0; n < num_n_elements; ++n) {
                         
                         // Get the N coordinate for this element (relative to block start)
-                        // CuTe: get<0>(t0KVcKV(vec, n, _0{})) = thread 0's N coordinate = n * thread_rows
-                        int n_coord = n * thread_rows;
+                        // CuTe: get<0>(t0KVcKV(vec, n, _0{})) = thread 0's N coordinate = n * kThreadRows
+                        int n_coord = n * kThreadRows;
                         
                         // Check if this N coordinate is within valid sequence length
                         bool n_is_valid;
@@ -1987,7 +1986,7 @@ struct CollectiveMainloopFwdSm80 {
                             #pragma unroll
                             for (int k = 0; k < num_k_elements; ++k) {
                                 int const offset_s = vec * stride_sv_K + n * stride_sn_K + k * stride_sk_K;
-                                int const smem_idx = thread_idx * threads_along_k + offset_s;
+                                int const smem_idx = thread_base_smem_K + offset_s;
                                 
                                 // Check if this K coordinate is within valid head dimension
                                 // CuTe: tKVpKV(k)
@@ -2002,7 +2001,7 @@ struct CollectiveMainloopFwdSm80 {
                                     tKsK_cur(vec, n, k) = value;
 #else
                                     int const offset_g = vec * stride_v_K + n * stride_m_K + k * stride_k_K;
-                                    int const gmem_idx = thread_base_offset_K + offset_g;
+                                    int const gmem_idx = thread_base_gmem_K + offset_g;
                                     Element value = gmem_tile_base_K[gmem_idx];
                                     smem_tile_base_K[smem_idx] = value;
 #endif
@@ -2076,7 +2075,7 @@ struct CollectiveMainloopFwdSm80 {
                 // Step 3: Dimensions (same partition as K: same GmemTiledCopyQKV, same tile shape)
                 // CuTe: size<0>(tVsV_cur), size<1>(tVsV_cur), size<2>(tVsV_cur)
                 static constexpr int num_vec_copies = kGmemElemsPerLoad;
-                static constexpr int num_n_elements = kBlockN / thread_rows;
+                static constexpr int num_n_elements = kBlockN / kThreadRows;
                 static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
 
 #if !FLASH_USE_CUTLASS_TENSOR
@@ -2084,7 +2083,7 @@ struct CollectiveMainloopFwdSm80 {
                 int const v_row_stride = static_cast<int>(get<0>(params.stride_V));
                 // Gmem strides (CuTe: tVgV.layout()(1,0,0,0), (0,1,0,0), (0,0,1,0)):
                 int const stride_v_V   = 1;
-                int const stride_n_V   = thread_rows * v_row_stride;
+                int const stride_n_V   = kThreadRows * v_row_stride;
                 int const stride_k_V   = kBlockKGmem;
                 // gmem thread base: (thread_row * row_stride_gmem) + (thread_col * kGmemElemsPerLoad)
                 int const thread_base_gmem_V = (thread_idx / kGmemThreadsPerRow) * v_row_stride
@@ -2092,7 +2091,7 @@ struct CollectiveMainloopFwdSm80 {
                 // Manual smem index calculation for V.
                 // SmemLayoutV is tile_to_shape of row-major atom (8, kBlockKGmem) → (kBlockN, kHeadDim, kStages).
                 // Physical offset = row * kHeadDim + col + stage * kBlockN * kHeadDim
-                //   row = thread_row + m * thread_rows
+                //   row = thread_row + m * kThreadRows
                 //   col = thread_col * kGmemElemsPerLoad + vec + k * kBlockKGmem
                 static constexpr int smem_row_stride_V  = kHeadDim;
                 static constexpr int smem_stage_stride_V = kBlockN * kHeadDim;
@@ -2115,14 +2114,13 @@ struct CollectiveMainloopFwdSm80 {
                         row_within_tile = true;
                     } else {
                         // CuTe: get<0>(tKVcKV(_0{}, m, _0{})) = thread's N coord for row m
-                        row_within_tile = (m < num_n_elements - 1) ||
-                                        (int(thread_idx / kGmemThreadsPerRow) + m * thread_rows < kBlockN);
+                        row_within_tile = (m < num_n_elements - 1) || (int(thread_idx / kGmemThreadsPerRow) + m * kThreadRows < kBlockN);
                     }
 
                     if (row_within_tile) {
                         // Second predicate: is this N row within sequence bounds?
-                        // CuTe: get<0>(t0KVcKV(_0{}, m, _0{})) = thread 0's N coord = m * thread_rows
-                        int n_coord = m * thread_rows;
+                        // CuTe: get<0>(t0KVcKV(_0{}, m, _0{})) = thread 0's N coord = m * kThreadRows
+                        int n_coord = m * kThreadRows;
                         bool const predicate_n = !Seqlenk_mask || (n_coord < seqlenk_row_limit);
 
                         #pragma unroll
@@ -2145,7 +2143,7 @@ struct CollectiveMainloopFwdSm80 {
                                 }
 #else
                                 int const smem_idx_V = thread_base_smem_V
-                                                     + m * thread_rows * smem_row_stride_V
+                                                     + m * kThreadRows * smem_row_stride_V
                                                      + vec
                                                      + k * kBlockKGmem
                                                      + smem_pipe_write * smem_stage_stride_V;
@@ -2371,66 +2369,8 @@ struct CollectiveMainloopFwdSm80 {
             uint32_t K_regs[KBlocksK * RegsPerKBlock];
 #endif
 
-// ============================================================================
-// SWITCH: Change #if 0 to #if 1 to use FULLY MANUAL version (no CuTe tensors)
-// ============================================================================
-#if 0
-            // ================================================================
-            // FULLY MANUAL VERSION: Simple scalar math that ACTUALLY WORKS
-            // ================================================================
-            // This version:
-            // 1. Uses simple for-loops instead of ldmatrix/MMA
-            // 2. Writes results directly to tSrS using CuTe's coordinate mapping
-            // 3. Produces correct results (but is MUCH slower than tensor cores)
-            //
-            // KEY INSIGHT: tSrS is a CuTe tensor where each thread owns certain
-            // (m,n) output elements. We use thr_mma.partition_C() on an identity
-            // tensor to get the coordinate mapping, then compute dot products.
-            // ================================================================
-            {
-                // Get raw pointers to shared memory (row-major layout)
-                half_t const* smem_Q_ptr = reinterpret_cast<half_t const*>(shared_storage.tensors.mainloop.smem_q.data());
-                half_t const* smem_K_ptr = reinterpret_cast<half_t const*>(shared_storage.tensors.mainloop.smem_k.data());
-                
-                // Create an identity tensor to get coordinate mapping
-                // This maps tSrS element index → (m, n) coordinate in output matrix
-                auto cS = thr_mma.partition_C(make_identity_tensor(
-                    make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
-                
-                // ============================================================
-                // MAIN COMPUTATION: For each element in tSrS, compute dot product
-                // ============================================================
-                #pragma unroll
-                for (int i = 0; i < size(tSrS); ++i) {
-                    // Get the (m, n) output coordinate for element i
-                    auto coord = cS(i);
-                    int m = get<0>(coord);
-                    int n = get<1>(coord);
-                    
-                    // Compute dot product: S[m,n] = sum_k Q[m,k] * K[n,k]
-                    float sum = 0.0f;
-                    
-                    if (m < kBlockM && n < kBlockN) {
-                        #pragma unroll
-                        for (int k = 0; k < kHeadDim; ++k) {
-                            // Q[m][k] - row m, column k
-                            float q_val = float(smem_Q_ptr[m * kHeadDim + k]);
-                            // K[n][k] - row n, column k (K^T means we want column n of K^T = row n of K)
-                            float k_val = float(smem_K_ptr[n * kHeadDim + k]);
-                            sum += q_val * k_val;
-                        }
-                    }
-                    // else: out of bounds, keep sum = 0
-                    
-                    // Store to register accumulator
-                    tSrS(i) = sum;
-                }
-                
-                // Trigger async V loading
-                load_V_next();
-            }
 
-#elif 0
+#if 0
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
