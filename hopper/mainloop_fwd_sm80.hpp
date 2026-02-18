@@ -1689,19 +1689,9 @@ struct CollectiveMainloopFwdSm80 {
         // CuTe: raw_pointer_cast(gK.data()) = ptr_K + varlen_offset + head_offset + batch_offset
         // CuTe: raw_pointer_cast(gV.data()) = ptr_V + varlen_offset + head_offset + batch_offset
         // Stride layout: ShapeQKV=(seqlen, d, head, batch), StrideQK=(row_stride, _1, head_stride, batch_stride)
-        Element const* gmem_Q_base = params.ptr_Q
-            + seqlen_info.offset_q * get<0>(params.stride_Q)
-            + bidh * get<2>(params.stride_Q)
-            + (!is_varlen_q ? bidb : 0) * get<3>(params.stride_Q)
-            + m_block * kBlockM * get<0>(params.stride_Q);
-        Element const* gmem_K_base = params.ptr_K
-            + seqlen_info.offset_k * get<0>(params.stride_K)
-            + bidh_kv * get<2>(params.stride_K)
-            + (!is_varlen_k ? bidb_kv : 0) * get<3>(params.stride_K);
-        Element const* gmem_V_base = params.ptr_V
-            + seqlen_info.offset_k * get<0>(params.stride_V)
-            + bidh_kv * get<2>(params.stride_V)
-            + (!is_varlen_k ? bidb_kv : 0) * get<3>(params.stride_V);
+        Element const* gmem_Q_base = params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q) + bidh    * get<2>(params.stride_Q) + (!is_varlen_q ? bidb    : 0) * get<3>(params.stride_Q) + m_block * kBlockM * get<0>(params.stride_Q);
+        Element const* gmem_K_base = params.ptr_K + seqlen_info.offset_k * get<0>(params.stride_K) + bidh_kv * get<2>(params.stride_K) + (!is_varlen_k ? bidb_kv : 0) * get<3>(params.stride_K);
+        Element const* gmem_V_base = params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V) + bidh_kv * get<2>(params.stride_V) + (!is_varlen_k ? bidb_kv : 0) * get<3>(params.stride_V);
 #endif
 
 #if FLASH_USE_CUTLASS_TENSOR
@@ -1714,55 +1704,26 @@ struct CollectiveMainloopFwdSm80 {
         Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
         Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
-        if (thread_idx == 0 && blockIdx.x == 0 && blockIdx.y == 0)
-        {
-            print("tKgK shape: ");
-            print(shape(tKgK));
-            print("\n");
-            print("tKgK stride: ");
-            print(stride(tKgK));
-            print("\n");
-            print("tKgK layout: ");
-            print(layout(tKgK));
-            print("\n");
-
-            // For a specific slice:
-            print("tKgK(_,_,_,0) layout: ");
-            print(layout(tKgK(_, _, _, 0)));
-            print("\n");
-        }
-#endif
-
         TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_slice(thread_idx);
 
         // Allocate "fragments/descriptors"
-#if FLASH_USE_CUTLASS_TENSOR
         Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
-#endif
 
         // Copy Atom retiling
-#if FLASH_USE_CUTLASS_TENSOR
         auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
         auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
         auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma);
         auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
         auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomTransposed{}, tiled_mma);
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
-#endif
-#if FLASH_USE_CUTLASS_TENSOR
+
         Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
-#else
-        Element const* smem_Q_ptr = smem_Q_base;
-#endif
-#if FLASH_USE_CUTLASS_TENSOR
         Tensor tSsK = smem_thr_copy_K.partition_S(sK);
-#else
-        Element const* smem_K_ptr = smem_K_base;
-#endif
-#if FLASH_USE_CUTLASS_TENSOR
         Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
 #else
+        Element const* smem_Q_ptr = smem_Q_base;
+        Element const* smem_K_ptr = smem_K_base;
         Element const* smem_V_ptr = smem_V_base;
 #endif
 
@@ -1835,155 +1796,68 @@ struct CollectiveMainloopFwdSm80 {
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
                 gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
             );
-#elif FLASH_USE_CUTLASS_TENSOR
-            // ============================================================================
-            // MANUAL REWRITE - What it does under the hood:
-            // ============================================================================
-
-            // Step 1: Calculate the M dimension limit (how many valid rows in this tile)
-            int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}));
-
-            // Step 2: Get tensor dimensions
-            // tQgQ and tQsQ have shape (VCOPY, MMA_M, MMA_K)
-            // - VCOPY: Number of vectorized copies per thread (e.g., 2)
-            // - MMA_M: Number of M elements this thread handles (e.g., 4)
-            // - MMA_K: Number of K elements this thread handles (e.g., 8)
-
-            int const num_vec_copies = size<0>(tQgQ);  // e.g., 2
-            int const num_m_elements = size<1>(tQgQ);  // e.g., 4  
-            int const num_k_elements = size<2>(tQgQ);  // e.g., 8
-
-            // Step 3: Triple nested loop with bounds checking
-            #pragma unroll
-            for (int vec = 0; vec < num_vec_copies; ++vec) {
-                
-                #pragma unroll
-                for (int m = 0; m < num_m_elements; ++m) {
-                    
-                    // Check if this M coordinate is within valid sequence length
-                    int m_coord = get<0>(t0QcQ(vec, m, _0{}));  // Get the global M coordinate
-                    bool m_is_valid = (m_coord < max_valid_m);
-                    
-                    if (m_is_valid) {
-                        // This M row is valid, process all K elements
-                        
-                        #pragma unroll
-                        for (int k = 0; k < num_k_elements; ++k) {
-                            
-                            // Check if this K coordinate is within valid head dimension
-                            bool k_is_valid = tQpQ(k);  // Predicate we computed earlier
-                            
-                            if (k_is_valid) {
-                                // Both M and K are valid - do the actual copy
-                                // This is typically a vectorized load (e.g., 128-bit)
-                                
-                                // Get source element from global memory
-                                Element value = tQgQ(vec, m, k);
-                                
-                                // Write to shared memory
-                                tQsQ(vec, m, k) = value;
-                                
-                            } else {
-                                // K is out of bounds - write zero to shared memory
-                                // (prevents garbage values from affecting MMA computation)
-                                tQsQ(vec, m, k) = Element(0);
-                            }
-                        }
-                        
-                    } else {
-                        // This M row is out of bounds
-                        // With Clear_OOB_MN=false, we do nothing (optimization)
-                        // The output will be masked later anyway
-                        // (If Clear_OOB_MN were true, we'd zero the entire row here)
-                    }
-                }
-            }
 #else
-            // ============================================================================
-            // MANUAL REWRITE - What it does under the hood:
-            // ============================================================================
-
-            // Step 1: Calculate the M dimension limit (how many valid rows in this tile)
+            // Q gmem→smem copy with bounds checking (Clear_OOB_MN=false, Clear_OOB_K=true)
+#if FLASH_USE_CUTLASS_TENSOR
+            int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}));
+            int const num_vec_copies = size<0>(tQgQ);
+            int const num_m_elements = size<1>(tQgQ);
+            int const num_k_elements = size<2>(tQgQ);
+#else
             // CuTe: get<0>(tQcQ(_0{}, _0{}, _0{})) = thread's first M-row in partition
             int const max_valid_m = seqlen_info.seqlen_q - m_block * kBlockM
                 - int(thread_idx / kGmemThreadsPerRow);
-
-            // Step 2: Get tensor dimensions
-            // tQgQ and tQsQ have shape (VCOPY, MMA_M, MMA_K)
-            // - VCOPY: Number of vectorized copies per thread (e.g., 2)
-            // - MMA_M: Number of M elements this thread handles (e.g., 4)
-            // - MMA_K: Number of K elements this thread handles (e.g., 8)
-
-            // CuTe tensor equivalent:
-            //   int const num_vec_copies = size<0>(tQgQ);
-            //   int const num_m_elements = size<1>(tQgQ);
-            //   int const num_k_elements = size<2>(tQgQ);
+            // CuTe: size<0/1/2>(tQgQ)
             static constexpr int num_vec_copies = kGmemElemsPerLoad;
             static constexpr int num_m_elements = kBlockM / thread_rows;
             static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
-            // Gmem strides (CuTe: tQgQ.layout()(1,0,0), (0,1,0), (0,0,1)):
+            // Gmem strides (CuTe: tQgQ.layout()(1,0,0), (0,1,0), (0,0,1))
             int const q_row_stride = static_cast<int>(get<0>(params.stride_Q));
-            int const stride_m_gmem = thread_rows * q_row_stride;
-
             int const stride_v_Q = 1;
-            int const stride_m_Q = thread_rows * stride_m_gmem;
-            int const stride_k_Q = kBlockKGmem;  // = kGmemThreadsPerRow * kGmemElemsPerLoad
-            // SmemLayoutQ is row-major (kBlockM, kHeadDim) with stride (kHeadDim, 1).
-            // Partition (vec, m, k) strides in smem:
-            //   vec: consecutive within a vectorized load → 1
-            //   m:   next row group for this thread → thread_rows * kHeadDim
-            //   k:   next K chunk → kBlockKGmem
+            int const stride_m_Q = thread_rows * thread_rows * q_row_stride;
+            int const stride_k_Q = kBlockKGmem;
+            // Smem strides (CuTe: tQsQ.layout()(1,0,0), (0,1,0), (0,0,1))
             static constexpr int stride_sv_Q = 1;
             static constexpr int stride_sm_Q = thread_rows * kHeadDim;
             static constexpr int stride_sk_Q = kBlockKGmem;
-            // Partition follows GmemLayoutAtom: (NumMmaThreads/kGmemThreadsPerRow, kGmemThreadsPerRow) with stride (kGmemThreadsPerRow, 1).
-            // Thread base = (thread_row)*row_stride + (thread_col)*threads_along_k; row_stride = (kHeadDim/2)*kGmemThreadsPerRow (smem layout).
+            // Thread base offsets in gmem/smem partitions
             int const threads_along_k = kGmemThreadsPerRow;
             int const thread_base_row_stride = (kHeadDim / 2) * kGmemThreadsPerRow;
-            int const thread_base_offset = (thread_idx / threads_along_k) * thread_base_row_stride + (thread_idx % threads_along_k) * threads_along_k;
-            // CuTe: raw_pointer_cast(gQ.data()), raw_pointer_cast(sQ.data())
+            int const thread_base_offset = (thread_idx / threads_along_k) * thread_base_row_stride
+                                         + (thread_idx % threads_along_k) * threads_along_k;
             Element const* gmem_tile_base = gmem_Q_base;
             Element* smem_tile_base = smem_Q_base;
-
-            // Step 3: Triple nested loop with bounds checking
+#endif
             #pragma unroll
             for (int vec = 0; vec < num_vec_copies; ++vec) {
-                
                 #pragma unroll
                 for (int m = 0; m < num_m_elements; ++m) {
-                    
-                    // Check if this M coordinate is within valid sequence length
-                    // CuTe: get<0>(t0QcQ(vec, m, _0{})) = thread 0's M coordinate = m * thread_rows
-                    int m_coord = m * thread_rows;
-                    bool m_is_valid = (m_coord < max_valid_m);
-                    
-                    if (m_is_valid) {
-                        // This M row is valid, process all K elements
-                        
+#if FLASH_USE_CUTLASS_TENSOR
+                    int m_coord = get<0>(t0QcQ(vec, m, _0{}));
+#else
+                    int m_coord = m * thread_rows;  // CuTe: get<0>(t0QcQ(vec, m, _0{}))
+#endif
+                    if (m_coord < max_valid_m) {
                         #pragma unroll
                         for (int k = 0; k < num_k_elements; ++k) {
-                            int const offset_s = vec * stride_sv_Q + m * stride_sm_Q + k * stride_sk_Q;
-                            int const smem_idx = thread_idx * threads_along_k + offset_s;
-
-                            // Check if this K coordinate is within valid head dimension
-                            // CuTe: tQpQ(k)
-                            bool k_is_valid = tQpQ_raw[k];
-
-                            if (k_is_valid) {
-                                int const offset_g = vec * stride_v_Q + m * stride_m_Q + k * stride_k_Q;
-                                int const gmem_idx = thread_base_offset + offset_g;
-                                Element value = gmem_tile_base[gmem_idx];
-                                smem_tile_base[smem_idx] = value;
+#if FLASH_USE_CUTLASS_TENSOR
+                            if (tQpQ(k)) {
+                                tQsQ(vec, m, k) = tQgQ(vec, m, k);
+                            } else {
+                                tQsQ(vec, m, k) = Element(0);
+                            }
+#else
+                            int const smem_idx = thread_idx * threads_along_k
+                                + vec * stride_sv_Q + m * stride_sm_Q + k * stride_sk_Q;
+                            if (tQpQ_raw[k]) {  // CuTe: tQpQ(k)
+                                int const gmem_idx = thread_base_offset
+                                    + vec * stride_v_Q + m * stride_m_Q + k * stride_k_Q;
+                                smem_tile_base[smem_idx] = gmem_tile_base[gmem_idx];
                             } else {
                                 smem_tile_base[smem_idx] = Element(0);
                             }
+#endif
                         }
-                        
-                    } else {
-                        // This M row is out of bounds
-                        // With Clear_OOB_MN=false, we do nothing (optimization)
-                        // The output will be masked later anyway
-                        // (If Clear_OOB_MN were true, we'd zero the entire row here)
                     }
                 }
             }
@@ -2253,8 +2127,11 @@ struct CollectiveMainloopFwdSm80 {
 
                         #pragma unroll
                         for (int k = 0; k < num_k_elements; ++k) {
-                            // CuTe: tKVpKV(k)
+#if FLASH_USE_CUTLASS_TENSOR
+                            bool const predicate_k = tKVpKV(k);
+#else
                             bool const predicate_k = tKVpKV_raw[k];
+#endif
                             bool const predicate_both = predicate_k && predicate_n;
 
                             #pragma unroll
