@@ -1657,18 +1657,11 @@ struct CollectiveMainloopFwdSm80 {
             }
         //}
 
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
         Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
-
-        Layout s8 = make_layout(Int<8>{});
-        Layout s2xs4 = make_layout(make_shape(Int<2>{}, Int<4>{}));
-        if (thread_idx == 0 && bidh == 0 && bidb == 0 && m_block == 0)
-        {
-            //print2D(s2xs4);
-        }
-        //print2D(s8);
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
@@ -1680,6 +1673,36 @@ struct CollectiveMainloopFwdSm80 {
         Tensor gK = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+#else
+        static_assert(!PackGQA, "Raw register path does not support PackGQA");
+        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
+        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
+
+        // Smem base pointers (CuTe: raw_pointer_cast(sQ/sK/sV.data()))
+        Element* smem_Q_base = shared_storage.tensors.mainloop.smem_q.data();
+        Element* smem_K_base = shared_storage.tensors.mainloop.smem_k.data();
+        Element* smem_V_base = shared_storage.tensors.mainloop.smem_v.data();
+
+        // Gmem base pointers after head/batch indexing
+        // CuTe: raw_pointer_cast(gQ.data()) = ptr_Q + varlen_offset + head_offset + batch_offset + m_block_offset
+        // CuTe: raw_pointer_cast(gK.data()) = ptr_K + varlen_offset + head_offset + batch_offset
+        // CuTe: raw_pointer_cast(gV.data()) = ptr_V + varlen_offset + head_offset + batch_offset
+        // Stride layout: ShapeQKV=(seqlen, d, head, batch), StrideQK=(row_stride, _1, head_stride, batch_stride)
+        Element const* gmem_Q_base = params.ptr_Q
+            + seqlen_info.offset_q * get<0>(params.stride_Q)
+            + bidh * get<2>(params.stride_Q)
+            + (!is_varlen_q ? bidb : 0) * get<3>(params.stride_Q)
+            + m_block * kBlockM * get<0>(params.stride_Q);
+        Element const* gmem_K_base = params.ptr_K
+            + seqlen_info.offset_k * get<0>(params.stride_K)
+            + bidh_kv * get<2>(params.stride_K)
+            + (!is_varlen_k ? bidb_kv : 0) * get<3>(params.stride_K);
+        Element const* gmem_V_base = params.ptr_V
+            + seqlen_info.offset_k * get<0>(params.stride_V)
+            + bidh_kv * get<2>(params.stride_V)
+            + (!is_varlen_k ? bidb_kv : 0) * get<3>(params.stride_V);
+#endif
 
 #if FLASH_USE_CUTLASS_TENSOR
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -1730,17 +1753,17 @@ struct CollectiveMainloopFwdSm80 {
 #if FLASH_USE_CUTLASS_TENSOR
         Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 #else
-        Element const* smem_Q_ptr = raw_pointer_cast(sQ.data());
+        Element const* smem_Q_ptr = smem_Q_base;
 #endif
 #if FLASH_USE_CUTLASS_TENSOR
         Tensor tSsK = smem_thr_copy_K.partition_S(sK);
 #else
-        Element const* smem_K_ptr = raw_pointer_cast(sK.data());
+        Element const* smem_K_ptr = smem_K_base;
 #endif
 #if FLASH_USE_CUTLASS_TENSOR
         Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
 #else
-        Element const* smem_V_ptr = raw_pointer_cast(sV.data());
+        Element const* smem_V_ptr = smem_V_base;
 #endif
 
         // Predicates
@@ -1918,8 +1941,9 @@ struct CollectiveMainloopFwdSm80 {
             int const threads_along_k = kGmemThreadsPerRow;
             int const thread_base_row_stride = (kHeadDim / 2) * kGmemThreadsPerRow;
             int const thread_base_offset = (thread_idx / threads_along_k) * thread_base_row_stride + (thread_idx % threads_along_k) * threads_along_k;
-            Element const* gmem_tile_base = raw_pointer_cast(gQ.data());
-            Element* smem_tile_base = raw_pointer_cast(sQ.data());
+            // CuTe: raw_pointer_cast(gQ.data()), raw_pointer_cast(sQ.data())
+            Element const* gmem_tile_base = gmem_Q_base;
+            Element* smem_tile_base = smem_Q_base;
 
             // Step 3: Triple nested loop with bounds checking
             #pragma unroll
@@ -2008,8 +2032,9 @@ struct CollectiveMainloopFwdSm80 {
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);  // Select pipeline stage
                 Tensor tKgK_cur = tKgK(_, _, _, n_block);          // Select K block
 #endif
-                Element * smem_tile_base_K = raw_pointer_cast(sK.data());
-                Element const * gmem_tile_base_K = raw_pointer_cast(gK.data());
+                // CuTe: raw_pointer_cast(sK.data()), raw_pointer_cast(gK.data())
+                Element * smem_tile_base_K = smem_K_base;
+                Element const * gmem_tile_base_K = gmem_K_base;
 
                 // Step 2: Calculate the N dimension limit (similar to Q's M limit)
                 // This is more complex than V because it handles the compile-time optimization better
@@ -2201,8 +2226,9 @@ struct CollectiveMainloopFwdSm80 {
                 int const thread_col_V = thread_idx % kGmemThreadsPerRow;
                 int const thread_base_smem_V = thread_row_V * smem_row_stride_V
                                              + thread_col_V * kGmemElemsPerLoad;
-                Element const* gmem_tile_base_V = raw_pointer_cast(gV(_, _, n_block).data());
-                Element* smem_tile_base_V = raw_pointer_cast(sV.data());
+                // CuTe: raw_pointer_cast(gV(_, _, n_block).data()), raw_pointer_cast(sV.data())
+                Element const* gmem_tile_base_V = gmem_V_base + n_block * kBlockN * get<0>(params.stride_V);
+                Element* smem_tile_base_V = smem_V_base;
 #endif
 
                 // Step 4: Nested loops with two levels of predicates
@@ -3079,7 +3105,7 @@ struct CollectiveMainloopFwdSm80 {
                         for (int m = 0; m < M_pv; ++m) {
                             #pragma unroll
                             for (int n = 0; n < N_pv; ++n) {
-                                int const ns = (m & 1) ? (N_pv - 1 - n) : n;  // serpentine
+                                int const ns = n;  // serpentine
                                 using MMA_Op = typename TiledMma::Atom::MMA_Op;
                                 using RegTypeD = typename std::remove_extent<typename MMA_Op::DRegisters>::type;
                                 using RegTypeA = typename std::remove_extent<typename MMA_Op::ARegisters>::type;
