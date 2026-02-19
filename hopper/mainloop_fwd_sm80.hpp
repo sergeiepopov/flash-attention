@@ -1396,6 +1396,9 @@ struct CollectiveMainloopFwdSm80 {
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). E.g. if hdim=128, we want each
     // thread to have 4 loads in the M direction and 2 vectorized load in the K direction.
     static constexpr int kBytePerRow = kHeadDim * sizeof(Element);
+    // How many elements along K do we load per row (across all threads assigned to that row)?
+    // Chosen to align with one cache line (128 bytes) when possible.
+    // In ideal case this is how many elements in one cache line, so we load one cache line at a time per row.
     static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
 
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
@@ -1430,10 +1433,11 @@ struct CollectiveMainloopFwdSm80 {
         AutoVectorizingCopyWithAssumedAlignment<128>
     >, Element>;
 
+    // How many threads will be loading the same row? We want to load one cache line at a time per row.
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static constexpr int kThreadRows = NumMmaThreads / kGmemThreadsPerRow;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
-    using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+    using GmemLayoutAtom = Layout<Shape <Int<kThreadRows>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(GmemCopyAtom{},

@@ -1986,21 +1986,17 @@ int main(int argc, char ** argv) {
 
         // Additional diagnostics for high relative error
         if (max_rel_error > 1.0f) {
-            std::cout << "\nWARNING: High relative error detected!" << std::endl;
-            
             // Find where the max relative error occurs
             auto max_rel_idx = rel_error.argmax();
             float ref_val = out_ref_f32.flatten()[max_rel_idx].item<float>();
             float flash_val = out_flash_f32.flatten()[max_rel_idx].item<float>();
             float abs_diff = std::abs(ref_val - flash_val);
             
-            std::cout << "  Location of max relative error:" << std::endl;
-            std::cout << "    Reference value: " << ref_val << std::endl;
-            std::cout << "    Flash value:     " << flash_val << std::endl;
-            std::cout << "    Absolute diff:   " << abs_diff << std::endl;
-            
-            if (std::abs(ref_val) < 0.01f) {
-                std::cout << "  Note: Reference value is near zero - relative error is inflated" << std::endl;
+            if (std::abs(ref_val) >= 0.01f) {
+                std::cout << "  Location of max relative error:" << std::endl;
+                std::cout << "    Reference value: " << ref_val << std::endl;
+                std::cout << "    Flash value:     " << flash_val << std::endl;
+                std::cout << "    Absolute diff:   " << abs_diff << std::endl;
             }
         }
 
