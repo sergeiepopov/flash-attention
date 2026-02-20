@@ -17,6 +17,8 @@
 #include "softmax.h"
 #include "utils.h"
 
+#define FLASH_USE_CUTLASS_TENSOR 0
+
 namespace flash {
 
 using namespace cute;
@@ -574,6 +576,7 @@ struct CollectiveMainloopBwdSm80 {
             // flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
             //     gmem_tiled_copy_QKV, tVgV, tVsV, t0KVcKV, tKVpKV, seqlenk_row_limit);
             int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
+#if FLASH_USE_CUTLASS_TENSOR
             #pragma unroll
             for (int m = 0; m < size<1>(tVsV); ++m) {
                 // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked
@@ -585,6 +588,91 @@ struct CollectiveMainloopBwdSm80 {
                     }
                 }
             }
+#else
+            {
+                // Raw index calculation for V gmem→smem copy.
+                // CuTe equivalent: cute::copy(gmem_tiled_copy_QKV.with(pred), tVgV(_, m, k), tVsV(_, m, k))
+                // Uses SM80_CP_ASYNC_CACHEGLOBAL semantics: OOB positions are NOT zero-filled.
+                static constexpr int kThreadRows_V = NumMmaThreads / kGmemThreadsPerRow;
+                static constexpr int num_n_elements = kBlockN / kThreadRows_V;  // CuTe: size<1>(tVsV)
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;   // CuTe: size<2>(tVsV)
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;        // CuTe: size<0>(tVsV)
+
+                int const thread_row = thread_idx / kGmemThreadsPerRow;
+                int const thread_col = thread_idx % kGmemThreadsPerRow;
+
+                // Gmem base pointer for V tile at (n_block), including head/batch/varlen offsets
+                // CuTe: raw_pointer_cast(gV.data())
+                int const v_row_stride = static_cast<int>(get<0>(params.stride_V));
+                Element const* gmem_V_ptr = params.ptr_V
+                    + seqlen_info.offset_k * v_row_stride
+                    + bidh_kv * static_cast<int>(get<2>(params.stride_V))
+                    + (!is_varlen_k ? bidb : 0) * static_cast<int>(get<3>(params.stride_V))
+                    + n_block * kBlockN * v_row_stride;
+                int const thread_base_gmem = thread_row * v_row_stride
+                                           + thread_col * kGmemElemsPerLoad;
+
+                // Smem base pointer for V
+                // CuTe: raw_pointer_cast(sV.data())
+                Element* smem_V_ptr = shared_storage.tensors.mainloop.smem_v.data();
+
+                // K-dimension predicates: which K-chunks are within valid head dimension
+                // CuTe: tVpV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_V)
+                int const headdim_V = get<1>(params.shape_V);
+                bool tVpV_raw[num_k_elements];
+                #pragma unroll
+                for (int kk = 0; kk < num_k_elements; ++kk) {
+                    tVpV_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_V;
+                }
+
+                // N-dimension limit: how many rows are valid in this tile
+                // CuTe: seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}))
+                int const remaining_seqlen = seqlen_k - n_block * kBlockN;
+
+                #pragma unroll
+                for (int m = 0; m < num_n_elements; ++m) {
+                    // CuTe: EvenN || m < size<1>(tVsV) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN
+                    bool row_within_tile;
+                    if constexpr (EvenN) {
+                        row_within_tile = true;
+                    } else {
+                        row_within_tile = (m < num_n_elements - 1)
+                            || (thread_row + m * kThreadRows_V < kBlockN);
+                    }
+
+                    if (row_within_tile) {
+                        int const actual_row = thread_row + m * kThreadRows_V;
+                        // CuTe: get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit
+                        bool const predicate_n = actual_row < remaining_seqlen;
+
+                        #pragma unroll
+                        for (int kk = 0; kk < num_k_elements; ++kk) {
+                            bool const predicate_both = tVpV_raw[kk] && predicate_n;
+
+                            #pragma unroll
+                            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                                int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+
+                                // Smem offset: tile_to_shape of (8, kBlockKGmem) atom → (kBlockN, kHeadDim)
+                                // produces shape ((8, N/8), (K, D/K)) with stride ((K, 8K), (1, KN)).
+                                // Then Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase> is applied on top.
+                                int const base_smem = (actual_row & 7) * kBlockKGmem
+                                    + (actual_row >> 3) * (8 * kBlockKGmem)
+                                    + (col & (kBlockKGmem - 1))
+                                    + (col / kBlockKGmem) * (kBlockKGmem * kBlockN);
+                                constexpr int swizzle_mask = ((1 << kSwizzle) - 1) << kSwizzleBase;
+                                int const smem_idx = base_smem ^ ((base_smem >> kSwizzleBase) & swizzle_mask);
+
+                                if (predicate_both) {
+                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows_V * v_row_stride + kk * kBlockKGmem;
+                                    smem_V_ptr[smem_idx] = gmem_V_ptr[gmem_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#endif
             if constexpr (V_in_regs) { flash::cp_async_fence(); }
             // flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
             //     gmem_tiled_copy_QKV, tKgK, tKsK, t0KVcKV, tKVpKV, seqlenk_row_limit);
