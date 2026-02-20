@@ -117,6 +117,9 @@ struct CollectiveMainloopBwdSm80 {
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). E.g. if hdim=128, we want each
     // thread to have 4 loads in the M direction and 2 vectorized load in the K direction.
     static constexpr int kBytePerRow = kHeadDim * sizeof(Element);
+    // How many elements along K do we load per row (across all threads assigned to that row)?
+    // Chosen to align with one cache line (128 bytes) when possible.
+    // In ideal case this is how many elements in one cache line, so we load one cache line at a time per row.
     static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
 
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
@@ -212,8 +215,9 @@ struct CollectiveMainloopBwdSm80 {
     using GmemCopyAtom = Copy_Atom<GmemCopyStruct, Element>;
 
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
+    static constexpr int kThreadRows = NumMmaThreads / kGmemThreadsPerRow;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
-    using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+    using GmemLayoutAtom = Layout<Shape <Int<kThreadRows>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(GmemCopyAtom{},
@@ -593,8 +597,7 @@ struct CollectiveMainloopBwdSm80 {
                 // Raw index calculation for V gmem→smem copy.
                 // CuTe equivalent: cute::copy(gmem_tiled_copy_QKV.with(pred), tVgV(_, m, k), tVsV(_, m, k))
                 // Uses SM80_CP_ASYNC_CACHEGLOBAL semantics: OOB positions are NOT zero-filled.
-                static constexpr int kThreadRows_V = NumMmaThreads / kGmemThreadsPerRow;
-                static constexpr int num_n_elements = kBlockN / kThreadRows_V;  // CuTe: size<1>(tVsV)
+                static constexpr int num_n_elements = kBlockN / kThreadRows;    // CuTe: size<1>(tVsV)
                 static constexpr int num_k_elements = kHeadDim / kBlockKGmem;   // CuTe: size<2>(tVsV)
                 static constexpr int num_vec_copies = kGmemElemsPerLoad;        // CuTe: size<0>(tVsV)
 
@@ -636,12 +639,11 @@ struct CollectiveMainloopBwdSm80 {
                     if constexpr (EvenN) {
                         row_within_tile = true;
                     } else {
-                        row_within_tile = (m < num_n_elements - 1)
-                            || (thread_row + m * kThreadRows_V < kBlockN);
+                        row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
                     }
 
                     if (row_within_tile) {
-                        int const actual_row = thread_row + m * kThreadRows_V;
+                        int const actual_row = thread_row + m * kThreadRows;
                         // CuTe: get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit
                         bool const predicate_n = actual_row < remaining_seqlen;
 
@@ -664,7 +666,7 @@ struct CollectiveMainloopBwdSm80 {
                                 int const smem_idx = base_smem ^ ((base_smem >> kSwizzleBase) & swizzle_mask);
 
                                 if (predicate_both) {
-                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows_V * v_row_stride + kk * kBlockKGmem;
+                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows * v_row_stride + kk * kBlockKGmem;
                                     smem_V_ptr[smem_idx] = gmem_V_ptr[gmem_idx];
                                 }
                             }
