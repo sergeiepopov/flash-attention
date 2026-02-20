@@ -23,7 +23,7 @@ message(STATUS "Python site-packages path: ${PYTHON_SITE_PACKAGES_PATH}")
 set(CMAKE_PREFIX_PATH "${PYTHON_SITE_PACKAGES_PATH}/torch/share/cmake" CACHE PATH "Path to CUTLASS root directory")
 
 # Options to speed up compilation by disabling features (all disabled by default for faster builds)
-option(FLASHATTENTION_DISABLE_BACKWARD "Disable backward pass" ON)
+option(FLASHATTENTION_DISABLE_BACKWARD "Disable backward pass" OFF)
 option(FLASHATTENTION_DISABLE_SPLIT "Disable split kernel" ON)
 option(FLASHATTENTION_DISABLE_PAGEDKV "Disable paged KV cache" ON)
 option(FLASHATTENTION_DISABLE_APPENDKV "Disable append KV" ON)
@@ -93,7 +93,13 @@ endif()
 
 find_package(Torch REQUIRED)
 
-add_executable(flash-attention hopper/main.cpp hopper/flash_prepare_scheduler.cu hopper/flash_fwd_combine.cu hopper/instantiations/flash_fwd_hdim64_fp16_sm80.cu hopper/flash_fwd_launch_template.h)
+add_executable(flash-attention
+    hopper/main.cpp hopper/flash_prepare_scheduler.cu
+    hopper/flash_fwd_combine.cu
+    hopper/instantiations/flash_bwd_hdim64_fp16_sm80.cu
+    hopper/instantiations/flash_fwd_hdim64_fp16_sm80.cu
+    hopper/flash_fwd_launch_template.h
+)
 
 #file(GLOB CU_SOURCES CONFIGURE_DEPENDS
 #  "${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_attn/src/*.cu"

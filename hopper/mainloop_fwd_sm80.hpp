@@ -2146,11 +2146,7 @@ struct CollectiveMainloopFwdSm80 {
                                     tVsV_cur(vec, m, k) = Element(0);
                                 }
 #else
-                                int const smem_idx_V = thread_base_smem_V
-                                                     + m * kThreadRows * smem_row_stride_V
-                                                     + vec
-                                                     + k * kBlockKGmem
-                                                     + smem_pipe_write * smem_stage_stride_V;
+                                int const smem_idx_V = thread_base_smem_V + m * kThreadRows * smem_row_stride_V + vec + k * kBlockKGmem + smem_pipe_write * smem_stage_stride_V;
                                 if (predicate_both) {
                                     int const offset_g_V = vec * stride_v_V + m * stride_n_V + k * stride_k_V;
                                     int const gmem_idx_V = thread_base_gmem_V + offset_g_V;

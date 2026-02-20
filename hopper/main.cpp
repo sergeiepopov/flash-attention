@@ -1255,6 +1255,7 @@ void run_mha_bwd_constexpr(Flash_bwd_params & params, cudaStream_t stream) {
 #endif
     }
     else {
+#ifndef FLASHATTENTION_DISABLE_BF16
 #ifndef FLASHATTENTION_DISABLE_HDIM64
         if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
 #endif
@@ -1269,6 +1270,7 @@ void run_mha_bwd_constexpr(Flash_bwd_params & params, cudaStream_t stream) {
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM256
         if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
+#endif
 #endif
     }
 }
@@ -1394,7 +1396,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
 
-    int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    int const arch = /*at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor*/80;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
     TORCH_CHECK(!deterministic || head_size_rounded < 256, "Deterministic backward not supported for hdim 256.");
@@ -1571,8 +1573,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 
-    // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
-    // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+    auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({ (seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads }, opts.dtype(torch::kInt32));
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
@@ -2009,13 +2011,248 @@ int main(int argc, char ** argv) {
         bool validation_passed = (max_abs_error < abs_tol || max_rel_error < rel_tol);
         
         if (validation_passed) {
-            std::cout << "\n=== VALIDATION PASSED ===" << std::endl;
+            std::cout << "\n=== FORWARD VALIDATION PASSED ===" << std::endl;
             std::cout << "Flash-Attention output matches reference implementation!" << std::endl;
         } else {
-            std::cerr << "\n=== VALIDATION FAILED ===" << std::endl;
+            std::cerr << "\n=== FORWARD VALIDATION FAILED ===" << std::endl;
             std::cerr << "Flash-Attention output does not match reference!" << std::endl;
             std::cerr << "Max error exceeds tolerance (abs_tol=" << abs_tol 
                       << ", rel_tol=" << rel_tol << ")" << std::endl;
+            return 1;
+        }
+
+        // ===== Backward pass test =====
+        std::cout << "\n--- Running backward pass test ---" << std::endl;
+
+        auto dout = torch::randn({ batch_size, seqlen_q, num_heads, head_dim }, options);
+
+        auto dq = torch::empty_like(q);
+        auto dk = torch::empty_like(k);
+        auto dv = torch::empty_like(v);
+
+        std::cout << "Calling mha_bwd..." << std::endl;
+
+        auto bwd_result = mha_bwd(
+            dout, q, k, v, out, softmax_lse,
+            dq,            // dq
+            dk,            // dk
+            dv,            // dv
+            std::nullopt,  // cu_seqlens_q
+            std::nullopt,  // cu_seqlens_k
+            std::nullopt,  // seqused_q
+            std::nullopt,  // seqused_k
+            std::nullopt,  // max_seqlen_q
+            std::nullopt,  // max_seqlen_k
+            std::nullopt,  // softmax_scale
+            true,          // is_causal
+            -1,            // window_size_left
+            -1,            // window_size_right
+            0.0,           // softcap
+            false,         // deterministic
+            0              // sm_margin
+        );
+
+        {
+            auto err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                std::cerr << "CUDA error after mha_bwd: " << cudaGetErrorString(err) << std::endl;
+                return 1;
+            }
+        }
+
+        // Inspect intermediate tensors returned by mha_bwd
+        auto bwd_softmax_d = std::get<0>(bwd_result).cpu().to(torch::kFloat32);
+        auto bwd_dq_accum = std::get<2>(bwd_result).cpu();  // already float32
+        std::cout << "Intermediate diagnostics:" << std::endl;
+        std::cout << "  softmax_d (D=rowsum(dO*O)): mean=" << bwd_softmax_d.mean().item<float>()
+            << " std=" << bwd_softmax_d.std().item<float>()
+            << " absmax=" << bwd_softmax_d.abs().max().item<float>()
+            << " num_zeros=" << (bwd_softmax_d == 0).sum().item<int64_t>()
+            << "/" << bwd_softmax_d.numel() << std::endl;
+        std::cout << "  dq_accum (f32, pre-postprocess): mean=" << bwd_dq_accum.mean().item<float>()
+            << " std=" << bwd_dq_accum.std().item<float>()
+            << " absmax=" << bwd_dq_accum.abs().max().item<float>()
+            << " num_zeros=" << (bwd_dq_accum == 0).sum().item<int64_t>()
+            << "/" << bwd_dq_accum.numel() << std::endl;
+
+        auto dq_cpu = dq.cpu();
+        auto dk_cpu = dk.cpu();
+        auto dv_cpu = dv.cpu();
+
+        bool bwd_has_nan = torch::isnan(dq_cpu).any().item<bool>() ||
+                           torch::isnan(dk_cpu).any().item<bool>() ||
+                           torch::isnan(dv_cpu).any().item<bool>();
+        bool bwd_has_inf = torch::isinf(dq_cpu).any().item<bool>() ||
+                           torch::isinf(dk_cpu).any().item<bool>() ||
+                           torch::isinf(dv_cpu).any().item<bool>();
+
+        if (bwd_has_nan || bwd_has_inf) {
+            std::cerr << "ERROR: Backward output contains NaN or Inf!" << std::endl;
+            return 1;
+        }
+
+        std::cout << "dQ shape: [" << dq.size(0) << ", " << dq.size(1)
+            << ", " << dq.size(2) << ", " << dq.size(3) << "]" << std::endl;
+        std::cout << "dK shape: [" << dk.size(0) << ", " << dk.size(1)
+            << ", " << dk.size(2) << ", " << dk.size(3) << "]" << std::endl;
+        std::cout << "dV shape: [" << dv.size(0) << ", " << dv.size(1)
+            << ", " << dv.size(2) << ", " << dv.size(3) << "]" << std::endl;
+
+        {
+            auto dq_f = dq_cpu.to(torch::kFloat32);
+            auto dk_f = dk_cpu.to(torch::kFloat32);
+            auto dv_f = dv_cpu.to(torch::kFloat32);
+            std::cout << "Flash dQ stats: mean=" << dq_f.mean().item<float>()
+                << " std=" << dq_f.std().item<float>()
+                << " absmax=" << dq_f.abs().max().item<float>()
+                << " num_zeros=" << (dq_f == 0).sum().item<int64_t>()
+                << "/" << dq_f.numel() << std::endl;
+            std::cout << "Flash dK stats: mean=" << dk_f.mean().item<float>()
+                << " std=" << dk_f.std().item<float>()
+                << " absmax=" << dk_f.abs().max().item<float>()
+                << " num_zeros=" << (dk_f == 0).sum().item<int64_t>()
+                << "/" << dk_f.numel() << std::endl;
+            std::cout << "Flash dV stats: mean=" << dv_f.mean().item<float>()
+                << " std=" << dv_f.std().item<float>()
+                << " absmax=" << dv_f.abs().max().item<float>()
+                << " num_zeros=" << (dv_f == 0).sum().item<int64_t>()
+                << "/" << dv_f.numel() << std::endl;
+        }
+
+        std::cout << "\n=== BACKWARD BASIC CHECKS PASSED ===" << std::endl;
+
+        // CPU-side backward validation
+        std::cout << "\n--- CPU Backward Validation (Causal Attention) ---" << std::endl;
+        std::cout << "Computing reference backward pass on CPU in float32..." << std::endl;
+
+        // Recompute forward and backward in float32 for reference accuracy
+        auto q_f32 = q_cpu.to(torch::kFloat32);
+        auto k_f32 = k_cpu.to(torch::kFloat32);
+        auto v_f32 = v_cpu.to(torch::kFloat32);
+        auto dout_f32 = dout.cpu().to(torch::kFloat32);
+
+        // Transpose to [batch, num_heads, seqlen, head_dim]
+        auto q_bwd = q_f32.transpose(1, 2);
+        auto k_bwd = k_f32.transpose(1, 2);
+        auto v_bwd = v_f32.transpose(1, 2);
+        auto dout_bwd = dout_f32.transpose(1, 2);
+
+        // Recompute forward pass in float32
+        // S = Q @ K^T * scale
+        auto scores_bwd = torch::matmul(q_bwd, k_bwd.transpose(-2, -1)) * scale;
+
+        // Apply causal mask
+        auto causal_mask_bwd = torch::triu(
+            torch::full({seqlen_q, seqlen_k}, -std::numeric_limits<float>::infinity(),
+                        torch::TensorOptions().dtype(torch::kFloat32)),
+            /*diagonal=*/1
+        );
+        scores_bwd = scores_bwd + causal_mask_bwd;
+
+        // P = softmax(S)
+        auto p_bwd = torch::softmax(scores_bwd, /*dim=*/-1);
+
+        // O_ref = P @ V
+        auto o_ref_bwd = torch::matmul(p_bwd, v_bwd);
+
+        // --- Backward pass ---
+        // dV = P^T @ dO
+        auto dv_ref = torch::matmul(p_bwd.transpose(-2, -1), dout_bwd);
+
+        // dP = dO @ V^T
+        auto dp_bwd = torch::matmul(dout_bwd, v_bwd.transpose(-2, -1));
+
+        // D = rowsum(dO * O_ref)
+        auto d_sum = (dout_bwd * o_ref_bwd).sum(/*dim=*/-1, /*keepdim=*/true);
+
+        // dS = P * (dP - D)
+        auto ds_bwd = p_bwd * (dp_bwd - d_sum);
+
+        // dQ = scale * dS @ K
+        auto dq_ref = torch::matmul(ds_bwd, k_bwd) * scale;
+
+        // dK = scale * dS^T @ Q
+        auto dk_ref = torch::matmul(ds_bwd.transpose(-2, -1), q_bwd) * scale;
+
+        // Transpose back to [batch, seqlen, num_heads, head_dim]
+        dq_ref = dq_ref.transpose(1, 2);
+        dk_ref = dk_ref.transpose(1, 2);
+        dv_ref = dv_ref.transpose(1, 2);
+
+        std::cout << "Ref dQ stats: mean=" << dq_ref.mean().item<float>()
+            << " std=" << dq_ref.std().item<float>()
+            << " absmax=" << dq_ref.abs().max().item<float>() << std::endl;
+        std::cout << "Ref dK stats: mean=" << dk_ref.mean().item<float>()
+            << " std=" << dk_ref.std().item<float>()
+            << " absmax=" << dk_ref.abs().max().item<float>() << std::endl;
+        std::cout << "Ref dV stats: mean=" << dv_ref.mean().item<float>()
+            << " std=" << dv_ref.std().item<float>()
+            << " absmax=" << dv_ref.abs().max().item<float>() << std::endl;
+
+        // Convert flash outputs to float32 for comparison
+        auto dq_flash_f32 = dq_cpu.to(torch::kFloat32);
+        auto dk_flash_f32 = dk_cpu.to(torch::kFloat32);
+        auto dv_flash_f32 = dv_cpu.to(torch::kFloat32);
+
+        // dQ errors
+        auto dq_diff = (dq_ref - dq_flash_f32).abs();
+        auto dq_rel = dq_diff / (dq_ref.abs() + 1e-5f);
+        float dq_max_abs = dq_diff.max().item<float>();
+        float dq_mean_abs = dq_diff.mean().item<float>();
+        float dq_max_rel = dq_rel.max().item<float>();
+        float dq_mean_rel = dq_rel.mean().item<float>();
+
+        // dK errors
+        auto dk_diff = (dk_ref - dk_flash_f32).abs();
+        auto dk_rel = dk_diff / (dk_ref.abs() + 1e-5f);
+        float dk_max_abs = dk_diff.max().item<float>();
+        float dk_mean_abs = dk_diff.mean().item<float>();
+        float dk_max_rel = dk_rel.max().item<float>();
+        float dk_mean_rel = dk_rel.mean().item<float>();
+
+        // dV errors
+        auto dv_diff = (dv_ref - dv_flash_f32).abs();
+        auto dv_rel = dv_diff / (dv_ref.abs() + 1e-5f);
+        float dv_max_abs = dv_diff.max().item<float>();
+        float dv_mean_abs = dv_diff.mean().item<float>();
+        float dv_max_rel = dv_rel.max().item<float>();
+        float dv_mean_rel = dv_rel.mean().item<float>();
+
+        std::cout << "dQ error statistics:" << std::endl;
+        std::cout << "  Max absolute error:  " << dq_max_abs << std::endl;
+        std::cout << "  Mean absolute error: " << dq_mean_abs << std::endl;
+        std::cout << "  Max relative error:  " << dq_max_rel << std::endl;
+        std::cout << "  Mean relative error: " << dq_mean_rel << std::endl;
+
+        std::cout << "dK error statistics:" << std::endl;
+        std::cout << "  Max absolute error:  " << dk_max_abs << std::endl;
+        std::cout << "  Mean absolute error: " << dk_mean_abs << std::endl;
+        std::cout << "  Max relative error:  " << dk_max_rel << std::endl;
+        std::cout << "  Mean relative error: " << dk_mean_rel << std::endl;
+
+        std::cout << "dV error statistics:" << std::endl;
+        std::cout << "  Max absolute error:  " << dv_max_abs << std::endl;
+        std::cout << "  Mean absolute error: " << dv_mean_abs << std::endl;
+        std::cout << "  Max relative error:  " << dv_max_rel << std::endl;
+        std::cout << "  Mean relative error: " << dv_mean_rel << std::endl;
+
+        const float bwd_abs_tol = 5e-2f;
+        const float bwd_rel_tol = 1e-1f;
+
+        bool bwd_dq_ok = (dq_max_abs < bwd_abs_tol || dq_mean_rel < bwd_rel_tol);
+        bool bwd_dk_ok = (dk_max_abs < bwd_abs_tol || dk_mean_rel < bwd_rel_tol);
+        bool bwd_dv_ok = (dv_max_abs < bwd_abs_tol || dv_mean_rel < bwd_rel_tol);
+
+        if (bwd_dq_ok && bwd_dk_ok && bwd_dv_ok) {
+            std::cout << "\n=== BACKWARD VALIDATION PASSED ===" << std::endl;
+            std::cout << "Flash-Attention backward output matches reference implementation!" << std::endl;
+        } else {
+            std::cerr << "\n=== BACKWARD VALIDATION FAILED ===" << std::endl;
+            if (!bwd_dq_ok) std::cerr << "  dQ exceeds tolerance" << std::endl;
+            if (!bwd_dk_ok) std::cerr << "  dK exceeds tolerance" << std::endl;
+            if (!bwd_dv_ok) std::cerr << "  dV exceeds tolerance" << std::endl;
+            std::cerr << "Tolerances: abs_tol=" << bwd_abs_tol
+                      << ", mean_rel_tol=" << bwd_rel_tol << std::endl;
             return 1;
         }
 
