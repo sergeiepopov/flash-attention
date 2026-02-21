@@ -58,13 +58,14 @@ struct CollectiveMainloopBwdSm80 {
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
-    static constexpr bool Has_cp_async = ArchTag::kMinComputeCapability >= 80;
+    static constexpr bool Has_cp_async = /*ArchTag::kMinComputeCapability >= 80*/false;
+    static constexpr bool UseSM80MMA = /*ArchTag::kMinComputeCapability >= 80*/ false;
 
     static constexpr int NumMmaThreads = NumMmaWarps * cutlass::NumThreadsPerWarp;
     static constexpr int NumProducerThreads = NumMmaThreads;  // For compatibility with TileScheduler
 
     using MMA_Atom_Arch = std::conditional_t<
-        ArchTag::kMinComputeCapability >= 80,
+        UseSM80MMA,
         std::conditional_t<
             std::is_same_v<Element, cutlass::half_t>,
             MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
@@ -85,10 +86,11 @@ struct CollectiveMainloopBwdSm80 {
         Layout<Shape<Int<NumMmaWarps / AtomLayoutMSdP>, Int<AtomLayoutMSdP>, _1>>
     >;
     static constexpr bool MmaSdPEvenN = ((!SdP_swapAB ? kBlockN : kBlockM) / size<1>(AtomLayoutSdP{})) % 16 == 0;
+    using MmaTileK = std::conditional_t<UseSM80MMA, _16, _8>;
     using TiledMmaSdP = TiledMMA<
         MMA_Atom_Arch,
         AtomLayoutSdP,
-        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutSdP{}))>, Int<(MmaSdPEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutSdP{}))>, _16>>;
+        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutSdP{}))>, Int<(MmaSdPEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutSdP{}))>, MmaTileK>>;
 
     using AtomLayoutdKV = std::conditional_t<
         !dKV_swapAB,
@@ -99,7 +101,7 @@ struct CollectiveMainloopBwdSm80 {
     using TiledMmadKV = TiledMMA<
         MMA_Atom_Arch,
         AtomLayoutdKV,
-        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdKV{}))>, Int<(MmadKVEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdKV{}))>, _16>>;
+        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdKV{}))>, Int<(MmadKVEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdKV{}))>, MmaTileK>>;
 
     using AtomLayoutdQ = std::conditional_t<
         !dQ_swapAB,
@@ -110,7 +112,7 @@ struct CollectiveMainloopBwdSm80 {
     using TiledMmadQ = TiledMMA<
         MMA_Atom_Arch,
         AtomLayoutdQ,
-        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdQ{}))>, Int<(MmadQEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdQ{}))>, _16>>;
+        Tile<Int<16 * CUTE_STATIC_V(size<0>(AtomLayoutdQ{}))>, Int<(MmadQEvenN ? 16 : 8) * CUTE_STATIC_V(size<1>(AtomLayoutdQ{}))>, MmaTileK >>;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "Headdim must be a multiple of kGmemElemsPerLoad");
@@ -194,12 +196,14 @@ struct CollectiveMainloopBwdSm80 {
     using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdQaccum{},
                                                          Layout<Shape < _1>>{}));  // Val layout, 1 vals per store
 
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
+    // SM75 m16n8k8 MMA has smaller fragments than SM80 m16n8k16, requiring
+    // smaller ldmatrix variants: x2 instead of x4 (full), x1 instead of x2 (half).
+    using SmemCopyAtom = Copy_Atom<std::conditional_t<UseSM80MMA, SM75_U32x4_LDSM_N, SM75_U32x2_LDSM_N>, Element>;
+    using SmemCopyAtomTransposed = Copy_Atom<std::conditional_t<UseSM80MMA, SM75_U16x8_LDSM_T, SM75_U16x4_LDSM_T>, Element>;
     // For the case where the N dimension of MmaSdP is divisible by 8 but not by 16
-    using SmemCopyAtomHalf = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
+    using SmemCopyAtomHalf = Copy_Atom<std::conditional_t<UseSM80MMA, SM75_U32x2_LDSM_N, SM75_U32x1_LDSM_N>, Element>;
     // For the case where the N dimension of MmadQ is divisible by 8 but not by 16
-    using SmemCopyAtomTransposedHalf = Copy_Atom<SM75_U16x4_LDSM_T, Element>;
+    using SmemCopyAtomTransposedHalf = Copy_Atom<std::conditional_t<UseSM80MMA, SM75_U16x4_LDSM_T, SM75_U16x2_LDSM_T>, Element>;
     // If !SdP_swapAB, the accum registers hold P / dS, otherwise they hold Pt / dSt.
     // If PdS_major is MN, then we need to "transpose" the write.
     // TODO: check this write
