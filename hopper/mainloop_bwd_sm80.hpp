@@ -682,6 +682,7 @@ struct CollectiveMainloopBwdSm80 {
             if constexpr (V_in_regs) { flash::cp_async_fence(); }
             // flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
             //     gmem_tiled_copy_QKV, tKgK, tKsK, t0KVcKV, tKVpKV, seqlenk_row_limit);
+#if FLASH_USE_CUTLASS_TENSOR
             #pragma unroll
             for (int m = 0; m < size<1>(tKsK); ++m) {
                 if (EvenN || m < size<1>(tKsK) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN) {
@@ -692,6 +693,73 @@ struct CollectiveMainloopBwdSm80 {
                     }
                 }
             }
+#else
+            {
+                static constexpr int num_n_elements = kBlockN / kThreadRows;
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;
+
+                int const thread_row = thread_idx / kGmemThreadsPerRow;
+                int const thread_col = thread_idx % kGmemThreadsPerRow;
+
+                int const k_row_stride = static_cast<int>(get<0>(params.stride_K));
+                Element const* gmem_K_ptr = params.ptr_K
+                    + seqlen_info.offset_k * k_row_stride
+                    + bidh_kv * static_cast<int>(get<2>(params.stride_K))
+                    + (!is_varlen_k ? bidb : 0) * static_cast<int>(get<3>(params.stride_K))
+                    + n_block * kBlockN * k_row_stride;
+                int const thread_base_gmem = thread_row * k_row_stride
+                                           + thread_col * kGmemElemsPerLoad;
+
+                Element* smem_K_ptr = shared_storage.tensors.mainloop.smem_k.data();
+
+                int const headdim_K = get<1>(params.shape_K);
+                bool tKpK_raw[num_k_elements];
+                #pragma unroll
+                for (int kk = 0; kk < num_k_elements; ++kk) {
+                    tKpK_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_K;
+                }
+
+                int const remaining_seqlen = seqlen_k - n_block * kBlockN;
+
+                #pragma unroll
+                for (int m = 0; m < num_n_elements; ++m) {
+                    bool row_within_tile;
+                    if constexpr (EvenN) {
+                        row_within_tile = true;
+                    } else {
+                        row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
+                    }
+
+                    if (row_within_tile) {
+                        int const actual_row = thread_row + m * kThreadRows;
+                        bool const predicate_n = actual_row < remaining_seqlen;
+
+                        #pragma unroll
+                        for (int kk = 0; kk < num_k_elements; ++kk) {
+                            bool const predicate_both = tKpK_raw[kk] && predicate_n;
+
+                            #pragma unroll
+                            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                                int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+
+                                int const base_smem = (actual_row & 7) * kBlockKGmem
+                                    + (actual_row >> 3) * (8 * kBlockKGmem)
+                                    + (col & (kBlockKGmem - 1))
+                                    + (col / kBlockKGmem) * (kBlockKGmem * kBlockN);
+                                constexpr int swizzle_mask = ((1 << kSwizzle) - 1) << kSwizzleBase;
+                                int const smem_idx = base_smem ^ ((base_smem >> kSwizzleBase) & swizzle_mask);
+
+                                if (predicate_both) {
+                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows * k_row_stride + kk * kBlockKGmem;
+                                    smem_K_ptr[smem_idx] = gmem_K_ptr[gmem_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#endif
             flash::cp_async_fence();
         }
 
@@ -710,6 +778,7 @@ struct CollectiveMainloopBwdSm80 {
 
         auto load_Q_LSE = [&] (int const m_block, int const smem_pipe_write) {
             // if (cute::thread0()) { printf("Inside load_Q_LSE, m_block = %d, smem_pipe_write = %d\n", m_block, smem_pipe_write); }
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tQsQ_cur = tQsQ(_, _, _, smem_pipe_write);
             Tensor tQgQ_cur = tQgQ(_, _, _, m_block);
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
@@ -742,10 +811,95 @@ struct CollectiveMainloopBwdSm80 {
                     cute::copy(gmem_tiled_copy_lse, tLSEgLSE_cur(_, m), tLSEsLSE_cur(_, m));
                 }
             }
+#else
+            {
+                static constexpr int num_m_elements = kBlockM / kThreadRows;
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;
+
+                int const thread_row = thread_idx / kGmemThreadsPerRow;
+                int const thread_col = thread_idx % kGmemThreadsPerRow;
+
+                int const q_row_stride = static_cast<int>(get<0>(params.stride_Q));
+                Element const* gmem_Q_ptr = params.ptr_Q
+                    + seqlen_info.offset_q * q_row_stride
+                    + bidh * static_cast<int>(get<2>(params.stride_Q))
+                    + (!is_varlen_q ? bidb : 0) * static_cast<int>(get<3>(params.stride_Q))
+                    + m_block * kBlockM * q_row_stride;
+                int const thread_base_gmem = thread_row * q_row_stride
+                                           + thread_col * kGmemElemsPerLoad;
+
+                Element* smem_Q_ptr = shared_storage.tensors.mainloop.smem_q.data();
+
+                int const headdim_Q = get<1>(params.shape_Q);
+                bool tQpQ_raw[num_k_elements];
+                #pragma unroll
+                for (int kk = 0; kk < num_k_elements; ++kk) {
+                    tQpQ_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_Q;
+                }
+
+                int const remaining_seqlen = seqlen_info.seqlen_q - m_block * kBlockM;
+
+                #pragma unroll
+                for (int m = 0; m < num_m_elements; ++m) {
+                    bool row_within_tile;
+                    if constexpr (EvenM) {
+                        row_within_tile = true;
+                    } else {
+                        row_within_tile = (m < num_m_elements - 1) || (thread_row + m * kThreadRows < kBlockM);
+                    }
+
+                    if (row_within_tile) {
+                        int const actual_row = thread_row + m * kThreadRows;
+                        bool const predicate_m = actual_row < remaining_seqlen;
+
+                        #pragma unroll
+                        for (int kk = 0; kk < num_k_elements; ++kk) {
+                            bool const predicate_both = tQpQ_raw[kk] && predicate_m;
+
+                            #pragma unroll
+                            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                                int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+
+                                int const base_smem = (actual_row & 7) * kBlockKGmem
+                                    + (actual_row >> 3) * (8 * kBlockKGmem)
+                                    + (col & (kBlockKGmem - 1))
+                                    + (col / kBlockKGmem) * (kBlockKGmem * kBlockM);
+                                constexpr int swizzle_mask = ((1 << kSwizzle) - 1) << kSwizzleBase;
+                                int const smem_idx = (base_smem ^ ((base_smem >> kSwizzleBase) & swizzle_mask))
+                                                   + smem_pipe_write * kBlockM * kHeadDim;
+
+                                if (predicate_both) {
+                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows * q_row_stride + kk * kBlockKGmem;
+                                    smem_Q_ptr[smem_idx] = gmem_Q_ptr[gmem_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            {
+                static constexpr int kLSEStride = cute::round_up(kBlockM, 64);
+                int const lse_base = thread_idx * 4;
+                float const* gmem_LSE_ptr = params.ptr_LSE_log2
+                    + seqlen_info.offset_q_padded
+                    + bidh * static_cast<int>(get<1>(params.stride_LSE_log2))
+                    + (!is_varlen_q ? bidb : 0) * static_cast<int>(get<2>(params.stride_LSE_log2))
+                    + m_block * kBlockM;
+                float* smem_LSE_ptr = shared_storage.tensors.mainloop.smem_lse.data();
+                if (lse_base < kBlockM) {
+                    #pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        smem_LSE_ptr[lse_base + v + smem_pipe_write * kLSEStride] = gmem_LSE_ptr[lse_base + v];
+                    }
+                }
+            }
+#endif
         };
 
         auto load_dO_dPsum = [&] (int const m_block, int const smem_pipe_write) {
             // if (cute::thread0()) { printf("Inside load_dO_dPsum, m_block = %d, smem_pipe_write = %d\n", m_block, smem_pipe_write); }
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tdOsdO_cur = tdOsdO(_, _, _, smem_pipe_write);
             Tensor tdOgdO_cur = tdOgdO(_, _, _, m_block);
             // int const seqlenq_row_limit = -int(get<0>(tQcQ(_0{}, _0{}, _0{}))) + (EvenM
@@ -773,6 +927,90 @@ struct CollectiveMainloopBwdSm80 {
                     cute::copy(gmem_tiled_copy_lse, tLSEgdPsum_cur(_, m), tLSEsdPsum_cur(_, m));
                 }
             }
+#else
+            {
+                static constexpr int num_m_elements = kBlockM / kThreadRows;
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;
+
+                int const thread_row = thread_idx / kGmemThreadsPerRow;
+                int const thread_col = thread_idx % kGmemThreadsPerRow;
+
+                int const do_row_stride = static_cast<int>(get<0>(params.stride_dO));
+                Element const* gmem_dO_ptr = params.ptr_dO
+                    + seqlen_info.offset_q * do_row_stride
+                    + bidh * static_cast<int>(get<2>(params.stride_dO))
+                    + (!is_varlen_q ? bidb : 0) * static_cast<int>(get<3>(params.stride_dO))
+                    + m_block * kBlockM * do_row_stride;
+                int const thread_base_gmem = thread_row * do_row_stride
+                                           + thread_col * kGmemElemsPerLoad;
+
+                Element* smem_dO_ptr = shared_storage.tensors.mainloop.smem_do.data();
+
+                int const headdim_dO = get<1>(params.shape_dO);
+                bool tdOpdO_raw[num_k_elements];
+                #pragma unroll
+                for (int kk = 0; kk < num_k_elements; ++kk) {
+                    tdOpdO_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_dO;
+                }
+
+                int const remaining_seqlen = seqlen_info.seqlen_q - m_block * kBlockM;
+
+                #pragma unroll
+                for (int m = 0; m < num_m_elements; ++m) {
+                    bool row_within_tile;
+                    if constexpr (EvenM) {
+                        row_within_tile = true;
+                    } else {
+                        row_within_tile = (m < num_m_elements - 1) || (thread_row + m * kThreadRows < kBlockM);
+                    }
+
+                    if (row_within_tile) {
+                        int const actual_row = thread_row + m * kThreadRows;
+                        bool const predicate_m = actual_row < remaining_seqlen;
+
+                        #pragma unroll
+                        for (int kk = 0; kk < num_k_elements; ++kk) {
+                            bool const predicate_both = tdOpdO_raw[kk] && predicate_m;
+
+                            #pragma unroll
+                            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                                int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+
+                                int const base_smem = (actual_row & 7) * kBlockKGmem
+                                    + (actual_row >> 3) * (8 * kBlockKGmem)
+                                    + (col & (kBlockKGmem - 1))
+                                    + (col / kBlockKGmem) * (kBlockKGmem * kBlockM);
+                                constexpr int swizzle_mask = ((1 << kSwizzle) - 1) << kSwizzleBase;
+                                int const smem_idx = (base_smem ^ ((base_smem >> kSwizzleBase) & swizzle_mask))
+                                                   + smem_pipe_write * kBlockM * kHeadDim;
+
+                                if (predicate_both) {
+                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows * do_row_stride + kk * kBlockKGmem;
+                                    smem_dO_ptr[smem_idx] = gmem_dO_ptr[gmem_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            {
+                static constexpr int kLSEStride = cute::round_up(kBlockM, 64);
+                int const lse_base = thread_idx * 4;
+                float const* gmem_dPsum_ptr = params.ptr_dPsum
+                    + seqlen_info.offset_q_padded
+                    + bidh * static_cast<int>(get<1>(params.stride_dPsum))
+                    + (!is_varlen_q ? bidb : 0) * static_cast<int>(get<2>(params.stride_dPsum))
+                    + m_block * kBlockM;
+                float* smem_dPsum_ptr = shared_storage.tensors.mainloop.smem_dpsum.data();
+                if (lse_base < kBlockM) {
+                    #pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        smem_dPsum_ptr[lse_base + v + smem_pipe_write * kLSEStride] = gmem_dPsum_ptr[lse_base + v];
+                    }
+                }
+            }
+#endif
         };
 
         int m_block = m_block_min;
