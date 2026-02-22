@@ -109,7 +109,7 @@ CUTLASS_DEVICE void copy_B_smem_to_raw_regs_sm75(
     static constexpr int NAtomsB = kBlockDimB_ / (AtomN * kNWarpsB_);
     static_assert(NAtomsB >= 1, "NAtomsB must be >= 1");
 
-    int const base_n = warp_b * NAtomsB * AtomN;
+    int const base_n = warp_b * AtomN;
 
     if constexpr (NAtomsB == 1) {
         int const row_in_sub = lane_id % 8;
@@ -128,11 +128,11 @@ CUTLASS_DEVICE void copy_B_smem_to_raw_regs_sm75(
         static constexpr int N_CPY = NAtomsB / 2;
         int const sub_matrix = (lane_id / 8) % 2;
         int const row_in_sub = lane_id % 8;
-        int const row_offset = sub_matrix * 8 + row_in_sub;
+        int const row_offset = sub_matrix * kNWarpsB_ * AtomN + row_in_sub;
 
         #pragma unroll
         for (int n = 0; n < N_CPY; ++n) {
-            int const smem_row = base_n + n * 16 + row_offset;
+            int const smem_row = base_n + n * 2 * kNWarpsB_ * AtomN + row_offset;
             int const smem_col = k_block * MmaTileK;
 
             Element_ const* addr = smem_base + smem_row * kDimK_ + smem_col;
@@ -1178,7 +1178,7 @@ struct CollectiveMainloopBwdSm80 {
         clear(tdVrdV);
 
         auto bwd_step = [&](int m_block, auto mask_fn) {
-#if FLASH_USE_CUTLASS_TENSOR || 1
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             clear(tSrS);
             flash::cp_async_wait<(kStages > 1) ? 1 : 0>();
@@ -1337,92 +1337,64 @@ struct CollectiveMainloopBwdSm80 {
                 tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, hook);
 #else
             // ============================================================
-            // Hybrid: CuTe tensors for smem→reg loading, raw explode for MMA
-            // dP = dO × V (or swapped)
+            // Raw register GEMM: dP = dO × V (or swapped)
             // ============================================================
-            Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
-            clear(tdPrdP);
+            float dP_regs[TotalSRegs];
+            #pragma unroll
+            for (int i = 0; i < TotalSRegs; ++i) dP_regs[i] = 0.f;
+            Tensor tdPrdP = make_tensor(make_rmem_ptr(dP_regs), tSrS_layout);
             int smem_pipe_read_do_cur = Q_dO_same_stages ? smem_pipe_read : smem_pipe_read_do;
             flash::cp_async_wait<(kStages_dO > 1) ? 1 : 0>();
             __syncthreads();
-            auto hook = cute::conditional_return<(kStages > 1)>(load_Q_next, nullptr);
-            Tensor tdPrdO = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sdO(_, _, _0{}));
-            Tensor tdPrV_cur = cute::conditional_return<V_in_regs>(tdPrV, mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sV));
 
-            using MMA_Op_dP = typename TiledMmaSdP::Atom::MMA_Op;
-            using RegTypeD_dP = typename std::remove_extent<typename MMA_Op_dP::DRegisters>::type;
-            using RegTypeA_dP = typename std::remove_extent<typename MMA_Op_dP::ARegisters>::type;
-            using RegTypeB_dP = typename std::remove_extent<typename MMA_Op_dP::BRegisters>::type;
-            using RegTypeC_dP = typename std::remove_extent<typename MMA_Op_dP::CRegisters>::type;
-            constexpr int RegNumD_dP = std::extent<typename MMA_Op_dP::DRegisters>::value;
-            constexpr int RegNumA_dP = std::extent<typename MMA_Op_dP::ARegisters>::value;
-            constexpr int RegNumB_dP = std::extent<typename MMA_Op_dP::BRegisters>::value;
-            constexpr int RegNumC_dP = std::extent<typename MMA_Op_dP::CRegisters>::value;
+            Element const* smem_A_dP = !SdP_swapAB
+                ? (shared_storage.tensors.mainloop.smem_do.data()
+                   + (kStages_dO > 1 ? smem_pipe_read_do_cur : 0) * kBlockM * kHeadDim)
+                : shared_storage.tensors.mainloop.smem_v.data();
+            Element const* smem_B_dP = !SdP_swapAB
+                ? shared_storage.tensors.mainloop.smem_v.data()
+                : (shared_storage.tensors.mainloop.smem_do.data()
+                   + (kStages_dO > 1 ? smem_pipe_read_do_cur : 0) * kBlockM * kHeadDim);
 
-            // Inline gemm_sm80 with explode instead of cute::gemm.
-            // Handle SwapAB by swapping A↔B (same convention as gemm_sm80).
-            if constexpr (SdP_swapAB) {
-                // After swap: A=V (smem_tiled_copy_KV), B=dO (smem_tiled_copy_QdO)
-                // A_in_regs = V_in_regs, B_in_regs = false
-                auto tCrA_cv = smem_thr_copy_KV.retile_D(tdPrV_cur);
-                auto tCrB_cv = smem_thr_copy_QdO.retile_D(tdPrdO);
-                auto tCsA_dP = tdPsV;
-                auto tCsB_dP = tdPsdO(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
-                if constexpr (!V_in_regs) { cute::copy(smem_tiled_copy_KV, tCsA_dP(_, _, _0{}), tCrA_cv(_, _, _0{})); }
-                cute::copy(smem_tiled_copy_QdO, tCsB_dP(_, _, _0{}), tCrB_cv(_, _, _0{}));
-                #pragma unroll
-                for (int k = 0; k < size<2>(tdPrV_cur); ++k) {
-                    if (k < size<2>(tdPrV_cur) - 1) {
-                        if constexpr (!V_in_regs) { cute::copy(smem_tiled_copy_KV, tCsA_dP(_, _, k + 1), tCrA_cv(_, _, k + 1)); }
-                        cute::copy(smem_tiled_copy_QdO, tCsB_dP(_, _, k + 1), tCrB_cv(_, _, k + 1));
-                    }
-                    if constexpr (kStages > 1) { if (k == 0) hook(); }
-                    #pragma unroll
-                    for (int m = 0; m < size<1>(tdPrdP); ++m) {
-                        #pragma unroll
-                        for (int n = 0; n < size<2>(tdPrdP); ++n) {
-                            flash::RawRegsBwd<RegTypeD_dP, RegNumD_dP> rD{reinterpret_cast<RegTypeD_dP*>(&tdPrdP(0, m, n))};
-                            flash::RawRegsBwd<RegTypeC_dP, RegNumC_dP> rC{reinterpret_cast<RegTypeC_dP*>(&tdPrdP(0, m, n))};
-                            flash::RawRegsBwd<RegTypeA_dP, RegNumA_dP> rA{reinterpret_cast<RegTypeA_dP*>(&tdPrV_cur(0, m, k))};
-                            flash::RawRegsBwd<RegTypeB_dP, RegNumB_dP> rB{reinterpret_cast<RegTypeB_dP*>(&tdPrdO(0, n, k))};
-                            cute::detail::explode(MMA_Op_dP::fma,
-                                rD, cute::make_int_sequence<RegNumD_dP>{},
-                                rA, cute::make_int_sequence<RegNumA_dP>{},
-                                rB, cute::make_int_sequence<RegNumB_dP>{},
-                                rC, cute::make_int_sequence<RegNumC_dP>{});
-                        }
-                    }
+            uint32_t A_regs_dP[KBlocks_SdP * RegsPerKBlockA_SdP];
+            uint32_t B_regs_dP[KBlocks_SdP * RegsPerKBlockB_SdP];
+
+            flash::copy_A_smem_to_raw_regs_sm75<kBlockDimA_SdP, kHeadDim, kNWarpsM_SdP>(
+                smem_A_dP, warp_m_SdP, lane_id_SdP, 0, &A_regs_dP[0]);
+            flash::copy_B_smem_to_raw_regs_sm75<kBlockDimB_SdP, kHeadDim, kNWarpsN_SdP>(
+                smem_B_dP, warp_n_SdP, lane_id_SdP, 0, &B_regs_dP[0]);
+
+            #pragma unroll
+            for (int k_block = 0; k_block < KBlocks_SdP; ++k_block) {
+                if (k_block < KBlocks_SdP - 1) {
+                    flash::copy_A_smem_to_raw_regs_sm75<kBlockDimA_SdP, kHeadDim, kNWarpsM_SdP>(
+                        smem_A_dP, warp_m_SdP, lane_id_SdP, k_block + 1,
+                        &A_regs_dP[(k_block + 1) * RegsPerKBlockA_SdP]);
+                    flash::copy_B_smem_to_raw_regs_sm75<kBlockDimB_SdP, kHeadDim, kNWarpsN_SdP>(
+                        smem_B_dP, warp_n_SdP, lane_id_SdP, k_block + 1,
+                        &B_regs_dP[(k_block + 1) * RegsPerKBlockB_SdP]);
                 }
-            } else {
-                // A=dO (smem_tiled_copy_QdO), B=V (smem_tiled_copy_KV)
-                // A_in_regs = false, B_in_regs = V_in_regs
-                auto tCrA_cv = smem_thr_copy_QdO.retile_D(tdPrdO);
-                auto tCrB_cv = smem_thr_copy_KV.retile_D(tdPrV_cur);
-                auto tCsA_dP = tdPsdO(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
-                auto tCsB_dP = tdPsV;
-                cute::copy(smem_tiled_copy_QdO, tCsA_dP(_, _, _0{}), tCrA_cv(_, _, _0{}));
-                if constexpr (!V_in_regs) { cute::copy(smem_tiled_copy_KV, tCsB_dP(_, _, _0{}), tCrB_cv(_, _, _0{})); }
+                if constexpr (kStages > 1) {
+                    if (k_block == 0) { load_Q_next(); }
+                }
                 #pragma unroll
-                for (int k = 0; k < size<2>(tdPrdO); ++k) {
-                    if (k < size<2>(tdPrdO) - 1) {
-                        cute::copy(smem_tiled_copy_QdO, tCsA_dP(_, _, k + 1), tCrA_cv(_, _, k + 1));
-                        if constexpr (!V_in_regs) { cute::copy(smem_tiled_copy_KV, tCsB_dP(_, _, k + 1), tCrB_cv(_, _, k + 1)); }
-                    }
-                    if constexpr (kStages > 1) { if (k == 0) hook(); }
+                for (int m = 0; m < NAtomsM_SdP; ++m) {
                     #pragma unroll
-                    for (int m = 0; m < size<1>(tdPrdP); ++m) {
-                        #pragma unroll
-                        for (int n = 0; n < size<2>(tdPrdP); ++n) {
-                            flash::RawRegsBwd<RegTypeD_dP, RegNumD_dP> rD{reinterpret_cast<RegTypeD_dP*>(&tdPrdP(0, m, n))};
-                            flash::RawRegsBwd<RegTypeC_dP, RegNumC_dP> rC{reinterpret_cast<RegTypeC_dP*>(&tdPrdP(0, m, n))};
-                            flash::RawRegsBwd<RegTypeA_dP, RegNumA_dP> rA{reinterpret_cast<RegTypeA_dP*>(&tdPrdO(0, m, k))};
-                            flash::RawRegsBwd<RegTypeB_dP, RegNumB_dP> rB{reinterpret_cast<RegTypeB_dP*>(&tdPrV_cur(0, n, k))};
-                            cute::detail::explode(MMA_Op_dP::fma,
-                                rD, cute::make_int_sequence<RegNumD_dP>{},
-                                rA, cute::make_int_sequence<RegNumA_dP>{},
-                                rB, cute::make_int_sequence<RegNumB_dP>{},
-                                rC, cute::make_int_sequence<RegNumC_dP>{});
-                        }
+                    for (int n = 0; n < NAtomsN_SdP; ++n) {
+                        int const ns = (m & 1) ? (NAtomsN_SdP - 1 - n) : n;
+                        flash::RawRegsBwd<RegTypeD_SdP, RegNumD_SdP> rD{
+                            &dP_regs[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_SdP]};
+                        flash::RawRegsBwd<RegTypeC_SdP, RegNumC_SdP> rC{
+                            &dP_regs[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_SdP]};
+                        flash::RawRegsBwd<RegTypeA_SdP, RegNumA_SdP> rA{reinterpret_cast<RegTypeA_SdP*>(
+                            &A_regs_dP[k_block * RegsPerKBlockA_SdP + m * VRegsPerAtomA_SdP])};
+                        flash::RawRegsBwd<RegTypeB_SdP, RegNumB_SdP> rB{reinterpret_cast<RegTypeB_SdP*>(
+                            &B_regs_dP[k_block * RegsPerKBlockB_SdP + ns * VRegsPerAtomB_SdP])};
+                        cute::detail::explode(MMA_Op_SdP::fma,
+                            rD, cute::make_int_sequence<RegNumD_SdP>{},
+                            rA, cute::make_int_sequence<RegNumA_SdP>{},
+                            rB, cute::make_int_sequence<RegNumB_SdP>{},
+                            rC, cute::make_int_sequence<RegNumC_SdP>{});
                     }
                 }
             }
