@@ -151,6 +151,117 @@ CUTLASS_DEVICE void copy_B_smem_to_raw_regs_sm75(
     }
 }
 
+// ============================================================================
+// SM75 A-operand TRANSPOSED smem→raw register copy.
+//
+// Source data is physically row-major (kDimK rows × kSmemStride cols).
+// The transposed view has M-rows along physical columns and K along physical
+// rows.  Uses ldmatrix.x2.trans to load and transpose 8×16 blocks.
+//
+// Template parameters:
+//   kBlockDimA_:  M-dimension (physical column count of the source matrix)
+//   kSmemStride_: physical row stride (= physical column count of the source)
+//   kNWarpsA_:    warps along the M-dimension
+// ============================================================================
+template<int kBlockDimA_, int kSmemStride_, int kNWarpsA_, typename Element_>
+CUTLASS_DEVICE void copy_A_smem_to_raw_regs_sm75_trans(
+    Element_ const* smem_base,
+    int warp_a,
+    int lane_id,
+    int k_block,
+    uint32_t* regs_k)
+{
+    static constexpr int MmaTileK = 8;
+    static constexpr int MmaAtomA = 16;
+    static constexpr int VRegsPerAtom = 2;
+    static constexpr int NAtomsA = kBlockDimA_ / (MmaAtomA * kNWarpsA_);
+
+    int const sub_matrix = (lane_id / 8) % 2;
+    int const row_in_sub = lane_id % 8;
+    int const phys_row = k_block * MmaTileK + row_in_sub;
+
+    #pragma unroll
+    for (int m = 0; m < NAtomsA; ++m) {
+        int const atom_col_start = m * (MmaAtomA * kNWarpsA_) + warp_a * MmaAtomA;
+        int const phys_col = atom_col_start + sub_matrix * 8;
+
+        Element_ const* addr = smem_base + phys_row * kSmemStride_ + phys_col;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
+            : "=r"(regs_k[m * VRegsPerAtom + 0]),
+              "=r"(regs_k[m * VRegsPerAtom + 1])
+            : "r"(smem_addr)
+        );
+    }
+}
+
+// ============================================================================
+// SM75 B-operand TRANSPOSED smem→raw register copy.
+//
+// Source data is physically row-major (kDimK rows × kSmemStride cols).
+// The transposed view has N-rows along physical columns and K along physical
+// rows.  Uses ldmatrix.x1.trans or ldmatrix.x2.trans.
+//
+// B-operand for m16n8k8: each atom is 8 cols × 8 K-rows = 1 uint32/thread.
+//
+// Template parameters:
+//   kBlockDimB_:  N-dimension (physical column count of the source matrix)
+//   kSmemStride_: physical row stride (= physical column count of the source)
+//   kNWarpsB_:    warps along the N-dimension
+// ============================================================================
+template<int kBlockDimB_, int kSmemStride_, int kNWarpsB_, typename Element_>
+CUTLASS_DEVICE void copy_B_smem_to_raw_regs_sm75_trans(
+    Element_ const* smem_base,
+    int warp_b,
+    int lane_id,
+    int k_block,
+    uint32_t* regs_k)
+{
+    static constexpr int MmaTileK = 8;
+    static constexpr int AtomN = 8;
+    static constexpr int NAtomsB = kBlockDimB_ / (AtomN * kNWarpsB_);
+    static_assert(NAtomsB >= 1, "NAtomsB must be >= 1");
+
+    int const base_n = warp_b * AtomN;
+    int const row_in_sub = lane_id % 8;
+    int const phys_row = k_block * MmaTileK + row_in_sub;
+
+    if constexpr (NAtomsB == 1) {
+        Element_ const* addr = smem_base + phys_row * kSmemStride_ + base_n;
+        uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+        asm volatile(
+            "ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];\n"
+            : "=r"(regs_k[0])
+            : "r"(smem_addr)
+        );
+    } else if constexpr (NAtomsB % 2 == 0) {
+        static constexpr int N_CPY = NAtomsB / 2;
+        int const sub_matrix = (lane_id / 8) % 2;
+
+        #pragma unroll
+        for (int n = 0; n < N_CPY; ++n) {
+            int const phys_col = base_n + n * 2 * kNWarpsB_ * AtomN
+                               + sub_matrix * kNWarpsB_ * AtomN;
+
+            Element_ const* addr = smem_base + phys_row * kSmemStride_ + phys_col;
+            uint32_t smem_addr = cute::cast_smem_ptr_to_uint(addr);
+
+            asm volatile(
+                "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"
+                : "=r"(regs_k[2*n + 0]),
+                  "=r"(regs_k[2*n + 1])
+                : "r"(smem_addr)
+            );
+        }
+    } else {
+        static_assert(NAtomsB == 1 || NAtomsB % 2 == 0,
+                      "Odd NAtomsB > 1 not supported");
+    }
+}
+
 template <int Stages, int Stages_dO, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
@@ -299,10 +410,16 @@ struct CollectiveMainloopBwdSm80 {
     static_assert(kPBlockN == 16 || kPBlockN == 32 || kPBlockN == 64);
     // static constexpr int kSwizzlePdS = kPBlockN == 16 ? 1 : (kPBlockN == 32 ? 2 : 3);
     static constexpr int kSwizzlePdS = 3;
+#if FLASH_USE_CUTLASS_TENSOR
     using SmemLayoutAtomPdS = decltype(
         composition(Swizzle<kSwizzlePdS, kSwizzleBase, kSwizzleBase>{},
                     Layout<Shape<Int<kBlockM>, Int<kPBlockN>>,
                            Stride<Int<kPBlockN>, _1>>{}));
+#else
+    using SmemLayoutAtomPdS = decltype(
+                    Layout<Shape<Int<kBlockM>, Int<kBlockN>>,
+                           Stride<Int<kBlockN>, _1>>{});
+#endif
     using SmemLayoutPdS = decltype(tile_to_shape(
         SmemLayoutAtomPdS{},
         make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
@@ -1261,6 +1378,39 @@ struct CollectiveMainloopBwdSm80 {
             constexpr int RegNumB_SdP = std::extent<typename MMA_Op_SdP::BRegisters>::value;
             constexpr int RegNumC_SdP = std::extent<typename MMA_Op_SdP::CRegisters>::value;
 
+            // ---- dKV GEMM constants (shared by dV and dK raw blocks) ----
+            static constexpr int kNWarpsM_dKV = CUTE_STATIC_V(size<0>(AtomLayoutdKV{}));
+            static constexpr int kNWarpsN_dKV = CUTE_STATIC_V(size<1>(AtomLayoutdKV{}));
+            static constexpr int kBlockDimA_dKV = !dKV_swapAB ? kBlockN : kHeadDim;
+            static constexpr int kBlockDimB_dKV = !dKV_swapAB ? kHeadDim : kBlockN;
+            static constexpr int kBlockK_dKV = kBlockM;
+            static constexpr int NAtomsM_dKV = kBlockDimA_dKV / (16 * kNWarpsM_dKV);
+            static constexpr int NAtomsN_dKV = kBlockDimB_dKV / (8 * kNWarpsN_dKV);
+            static constexpr int KBlocks_dKV = kBlockK_dKV / kMmaTileK_SdP;
+            static constexpr int RegsPerKBlockA_dKV = NAtomsM_dKV * VRegsPerAtomA_SdP;
+            static constexpr int RegsPerKBlockB_dKV = NAtomsN_dKV * VRegsPerAtomB_SdP;
+            static constexpr int TotalRegs_dKV = NAtomsM_dKV * NAtomsN_dKV * VRegsPerAtomS;
+            int const warp_m_dKV = warp_id_SdP % kNWarpsM_dKV;
+            int const warp_n_dKV = warp_id_SdP / kNWarpsM_dKV;
+            // Smem strides for transposed operands
+            static constexpr int kSmemStridePdS = kBlockN;
+            static constexpr int kSmemStrideQdO = kHeadDim;
+
+            // ---- dQ GEMM constants ----
+            static constexpr int kNWarpsM_dQ = CUTE_STATIC_V(size<0>(AtomLayoutdQ{}));
+            static constexpr int kNWarpsN_dQ = CUTE_STATIC_V(size<1>(AtomLayoutdQ{}));
+            static constexpr int kBlockDimA_dQ = !dQ_swapAB ? kBlockM : kHeadDim;
+            static constexpr int kBlockDimB_dQ = !dQ_swapAB ? kHeadDim : kBlockM;
+            static constexpr int kBlockK_dQ = kBlockN;
+            static constexpr int NAtomsM_dQ = kBlockDimA_dQ / (16 * kNWarpsM_dQ);
+            static constexpr int NAtomsN_dQ = kBlockDimB_dQ / (8 * kNWarpsN_dQ);
+            static constexpr int KBlocks_dQ = kBlockK_dQ / kMmaTileK_SdP;
+            static constexpr int RegsPerKBlockA_dQ = NAtomsM_dQ * VRegsPerAtomA_SdP;
+            static constexpr int RegsPerKBlockB_dQ = NAtomsN_dQ * VRegsPerAtomB_SdP;
+            static constexpr int TotalRegs_dQ = NAtomsM_dQ * NAtomsN_dQ * VRegsPerAtomS;
+            int const warp_m_dQ = warp_id_SdP % kNWarpsM_dQ;
+            int const warp_n_dQ = warp_id_SdP / kNWarpsM_dQ;
+
             #pragma unroll
             for (int k_block = 0; k_block < KBlocks_SdP; ++k_block) {
                 if (k_block < KBlocks_SdP - 1) {
@@ -1439,6 +1589,7 @@ struct CollectiveMainloopBwdSm80 {
             Tensor tdSadS = r2s_thr_copy_PdS.retile_S(rdS);   // ((Atom,AtomNum), MMA_N, MMA_N)
             cute::copy(r2s_tiled_copy_PdS, tdSadS, tdSsdS);
 
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
             Tensor tdVsdO_cur = tdVsdOt(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
             if constexpr (Mma_dKV_is_RS) {
@@ -1450,19 +1601,193 @@ struct CollectiveMainloopBwdSm80 {
                     tdVrdV, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
                     tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, nullptr);
             }
+#else
+            // ============================================================
+            // Raw register GEMM: dV += Pt × dOt (or swapped)
+            // ============================================================
+            if constexpr (Mma_dKV_is_RS) {
+                // RS: A = rP already in registers, B = dOt from smem (transposed)
+                uint32_t* A_regs_dV_rs = reinterpret_cast<uint32_t*>(&rP(0));
+                Element const* smem_B_dV_rs = shared_storage.tensors.mainloop.smem_do.data()
+                    + (kStages_dO > 1 ? smem_pipe_read_do_cur : 0) * kBlockM * kHeadDim;
+
+                uint32_t B_regs_dV[KBlocks_dKV * RegsPerKBlockB_dKV];
+                flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                    smem_B_dV_rs, warp_n_dKV, lane_id_SdP, 0, &B_regs_dV[0]);
+
+                float* dV_acc = &tdVrdV(0);
+                #pragma unroll
+                for (int k_block = 0; k_block < KBlocks_dKV; ++k_block) {
+                    if (k_block < KBlocks_dKV - 1) {
+                        flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                            smem_B_dV_rs, warp_n_dKV, lane_id_SdP, k_block + 1,
+                            &B_regs_dV[(k_block + 1) * RegsPerKBlockB_dKV]);
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_dKV; ++m) {
+                        #pragma unroll
+                        for (int n = 0; n < NAtomsN_dKV; ++n) {
+                            int const ns = (m & 1) ? (NAtomsN_dKV - 1 - n) : n;
+                            flash::RawRegsBwd<RegTypeD_SdP, RegNumD_SdP> rD{
+                                &dV_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeC_SdP, RegNumC_SdP> rC{
+                                &dV_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeA_SdP, RegNumA_SdP> rA{reinterpret_cast<RegTypeA_SdP*>(
+                                &A_regs_dV_rs[k_block * RegsPerKBlockA_dKV + m * VRegsPerAtomA_SdP])};
+                            flash::RawRegsBwd<RegTypeB_SdP, RegNumB_SdP> rB{reinterpret_cast<RegTypeB_SdP*>(
+                                &B_regs_dV[k_block * RegsPerKBlockB_dKV + ns * VRegsPerAtomB_SdP])};
+                            cute::detail::explode(MMA_Op_SdP::fma,
+                                rD, cute::make_int_sequence<RegNumD_SdP>{},
+                                rA, cute::make_int_sequence<RegNumA_SdP>{},
+                                rB, cute::make_int_sequence<RegNumB_SdP>{},
+                                rC, cute::make_int_sequence<RegNumC_SdP>{});
+                        }
+                    }
+                }
+            } else {
+                Element const* smem_A_dV = !dKV_swapAB
+                    ? shared_storage.tensors.mainloop.smem_p.data()
+                    : (shared_storage.tensors.mainloop.smem_do.data()
+                       + (kStages_dO > 1 ? smem_pipe_read_do_cur : 0) * kBlockM * kHeadDim);
+                Element const* smem_B_dV = !dKV_swapAB
+                    ? (shared_storage.tensors.mainloop.smem_do.data()
+                       + (kStages_dO > 1 ? smem_pipe_read_do_cur : 0) * kBlockM * kHeadDim)
+                    : shared_storage.tensors.mainloop.smem_p.data();
+
+                uint32_t A_regs_dV[KBlocks_dKV * RegsPerKBlockA_dKV];
+                uint32_t B_regs_dV[KBlocks_dKV * RegsPerKBlockB_dKV];
+
+                flash::copy_A_smem_to_raw_regs_sm75_trans<kBlockDimA_dKV, kBlockDimA_dKV, kNWarpsM_dKV>(
+                    smem_A_dV, warp_m_dKV, lane_id_SdP, 0, &A_regs_dV[0]);
+                flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                    smem_B_dV, warp_n_dKV, lane_id_SdP, 0, &B_regs_dV[0]);
+
+                float* dV_acc = &tdVrdV(0);
+                #pragma unroll
+                for (int k_block = 0; k_block < KBlocks_dKV; ++k_block) {
+                    if (k_block < KBlocks_dKV - 1) {
+                        flash::copy_A_smem_to_raw_regs_sm75_trans<kBlockDimA_dKV, kBlockDimA_dKV, kNWarpsM_dKV>(
+                            smem_A_dV, warp_m_dKV, lane_id_SdP, k_block + 1,
+                            &A_regs_dV[(k_block + 1) * RegsPerKBlockA_dKV]);
+                        flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                            smem_B_dV, warp_n_dKV, lane_id_SdP, k_block + 1,
+                            &B_regs_dV[(k_block + 1) * RegsPerKBlockB_dKV]);
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_dKV; ++m) {
+                        #pragma unroll
+                        for (int n = 0; n < NAtomsN_dKV; ++n) {
+                            int const ns = (m & 1) ? (NAtomsN_dKV - 1 - n) : n;
+                            flash::RawRegsBwd<RegTypeD_SdP, RegNumD_SdP> rD{
+                                &dV_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeC_SdP, RegNumC_SdP> rC{
+                                &dV_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeA_SdP, RegNumA_SdP> rA{reinterpret_cast<RegTypeA_SdP*>(
+                                &A_regs_dV[k_block * RegsPerKBlockA_dKV + m * VRegsPerAtomA_SdP])};
+                            flash::RawRegsBwd<RegTypeB_SdP, RegNumB_SdP> rB{reinterpret_cast<RegTypeB_SdP*>(
+                                &B_regs_dV[k_block * RegsPerKBlockB_dKV + ns * VRegsPerAtomB_SdP])};
+                            cute::detail::explode(MMA_Op_SdP::fma,
+                                rD, cute::make_int_sequence<RegNumD_SdP>{},
+                                rA, cute::make_int_sequence<RegNumA_SdP>{},
+                                rB, cute::make_int_sequence<RegNumB_SdP>{},
+                                rC, cute::make_int_sequence<RegNumC_SdP>{});
+                        }
+                    }
+                }
+            }
+#endif
             // if (cute::thread0()) { print_tensor(tdVrdV); }
             __syncthreads();  // make sure sdS is written
             auto do_mma_dQ = [&] (auto hook) {
+#if FLASH_USE_CUTLASS_TENSOR
                 Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
                 clear(tdQrdQ);
                 Tensor tdQrdS = mma_partition_fragment_AB</*A=*/!dQ_swapAB>(thr_mma_dQ, sdS);
                 Tensor tdQrK = mma_partition_fragment_AB</*A=*/dQ_swapAB>(thr_mma_dQ, sKt);
                 flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dQ_swapAB>(
                     tdQrdQ, tdQrdS, tdQrK, tdQsdS, tdQsKt, tiled_mma_dQ,
-                    // smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt, load_dO_next);
                     smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt, hook);
+#else
+                // ============================================================
+                // Raw register GEMM: dQ += dS × Kt (or swapped)
+                // ============================================================
+                float dQ_regs[TotalRegs_dQ];
+                #pragma unroll
+                for (int i = 0; i < TotalRegs_dQ; ++i) dQ_regs[i] = 0.f;
+                auto tdQrdQ_layout = make_layout(make_shape(Int<VRegsPerAtomS>{}, Int<NAtomsM_dQ>{}, Int<NAtomsN_dQ>{}));
+                Tensor tdQrdQ = make_tensor(make_rmem_ptr(dQ_regs), tdQrdQ_layout);
+
+                // A = dS (non-trans), B = Kt (trans) when !dQ_swapAB
+                // A = Kt (trans), B = dS (non-trans) when dQ_swapAB
+                Element const* smem_A_dQ = !dQ_swapAB
+                    ? shared_storage.tensors.mainloop.smem_ds.data()
+                    : shared_storage.tensors.mainloop.smem_k.data();
+                Element const* smem_B_dQ = !dQ_swapAB
+                    ? shared_storage.tensors.mainloop.smem_k.data()
+                    : shared_storage.tensors.mainloop.smem_ds.data();
+
+                uint32_t A_regs_dQ[KBlocks_dQ * RegsPerKBlockA_dQ];
+                uint32_t B_regs_dQ[KBlocks_dQ * RegsPerKBlockB_dQ];
+
+                if constexpr (!dQ_swapAB) {
+                    flash::copy_A_smem_to_raw_regs_sm75<kBlockDimA_dQ, kBlockK_dQ, kNWarpsM_dQ>(
+                        smem_A_dQ, warp_m_dQ, lane_id_SdP, 0, &A_regs_dQ[0]);
+                    flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dQ, kBlockDimB_dQ, kNWarpsN_dQ>(
+                        smem_B_dQ, warp_n_dQ, lane_id_SdP, 0, &B_regs_dQ[0]);
+                } else {
+                    flash::copy_A_smem_to_raw_regs_sm75_trans<kBlockDimA_dQ, kBlockDimA_dQ, kNWarpsM_dQ>(
+                        smem_A_dQ, warp_m_dQ, lane_id_SdP, 0, &A_regs_dQ[0]);
+                    flash::copy_B_smem_to_raw_regs_sm75<kBlockDimB_dQ, kBlockK_dQ, kNWarpsN_dQ>(
+                        smem_B_dQ, warp_n_dQ, lane_id_SdP, 0, &B_regs_dQ[0]);
+                }
+
+                #pragma unroll
+                for (int k_block = 0; k_block < KBlocks_dQ; ++k_block) {
+                    if (k_block < KBlocks_dQ - 1) {
+                        if constexpr (!dQ_swapAB) {
+                            flash::copy_A_smem_to_raw_regs_sm75<kBlockDimA_dQ, kBlockK_dQ, kNWarpsM_dQ>(
+                                smem_A_dQ, warp_m_dQ, lane_id_SdP, k_block + 1,
+                                &A_regs_dQ[(k_block + 1) * RegsPerKBlockA_dQ]);
+                            flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dQ, kBlockDimB_dQ, kNWarpsN_dQ>(
+                                smem_B_dQ, warp_n_dQ, lane_id_SdP, k_block + 1,
+                                &B_regs_dQ[(k_block + 1) * RegsPerKBlockB_dQ]);
+                        } else {
+                            flash::copy_A_smem_to_raw_regs_sm75_trans<kBlockDimA_dQ, kBlockDimA_dQ, kNWarpsM_dQ>(
+                                smem_A_dQ, warp_m_dQ, lane_id_SdP, k_block + 1,
+                                &A_regs_dQ[(k_block + 1) * RegsPerKBlockA_dQ]);
+                            flash::copy_B_smem_to_raw_regs_sm75<kBlockDimB_dQ, kBlockK_dQ, kNWarpsN_dQ>(
+                                smem_B_dQ, warp_n_dQ, lane_id_SdP, k_block + 1,
+                                &B_regs_dQ[(k_block + 1) * RegsPerKBlockB_dQ]);
+                        }
+                    }
+                    if (k_block == 0) {
+                        if constexpr (!std::is_same_v<std::remove_cv_t<decltype(hook)>, std::nullptr_t>) {
+                            hook();
+                        }
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_dQ; ++m) {
+                        #pragma unroll
+                        for (int n = 0; n < NAtomsN_dQ; ++n) {
+                            int const ns = (m & 1) ? (NAtomsN_dQ - 1 - n) : n;
+                            flash::RawRegsBwd<RegTypeD_SdP, RegNumD_SdP> rD{
+                                &dQ_regs[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dQ]};
+                            flash::RawRegsBwd<RegTypeC_SdP, RegNumC_SdP> rC{
+                                &dQ_regs[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dQ]};
+                            flash::RawRegsBwd<RegTypeA_SdP, RegNumA_SdP> rA{reinterpret_cast<RegTypeA_SdP*>(
+                                &A_regs_dQ[k_block * RegsPerKBlockA_dQ + m * VRegsPerAtomA_SdP])};
+                            flash::RawRegsBwd<RegTypeB_SdP, RegNumB_SdP> rB{reinterpret_cast<RegTypeB_SdP*>(
+                                &B_regs_dQ[k_block * RegsPerKBlockB_dQ + ns * VRegsPerAtomB_SdP])};
+                            cute::detail::explode(MMA_Op_SdP::fma,
+                                rD, cute::make_int_sequence<RegNumD_SdP>{},
+                                rA, cute::make_int_sequence<RegNumA_SdP>{},
+                                rB, cute::make_int_sequence<RegNumB_SdP>{},
+                                rC, cute::make_int_sequence<RegNumC_SdP>{});
+                        }
+                    }
+                }
+#endif
                 // if (cute::thread0()) { print_tensor(tdQrdQ); }
-                // We can reuse r2s_thr_copy_dQaccum for this partitioning
                 Tensor tdQrdQ_atomic = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
                 Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
                 static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
@@ -1471,6 +1796,7 @@ struct CollectiveMainloopBwdSm80 {
             };
             // If kStages == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
             if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));
             Tensor tdKsQ_cur = tdKsQt(_, _, _, kStages > 1 ? smem_pipe_read : 0);
             if constexpr (Mma_dKV_is_RS) {
@@ -1482,6 +1808,107 @@ struct CollectiveMainloopBwdSm80 {
                     tdKrdK, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
                     tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
             }
+#else
+            // ============================================================
+            // Raw register GEMM: dK += dSt × Qt (or swapped)
+            // ============================================================
+            if constexpr (Mma_dKV_is_RS) {
+                // RS: A = rdS already in registers, B = Qt from smem (transposed)
+                uint32_t* A_regs_dK_rs = reinterpret_cast<uint32_t*>(&rdS(0));
+                Element const* smem_B_dK_rs = shared_storage.tensors.mainloop.smem_q.data()
+                    + (kStages > 1 ? smem_pipe_read : 0) * kBlockM * kHeadDim;
+
+                uint32_t B_regs_dK[KBlocks_dKV * RegsPerKBlockB_dKV];
+                flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                    smem_B_dK_rs, warp_n_dKV, lane_id_SdP, 0, &B_regs_dK[0]);
+
+                float* dK_acc = &tdKrdK(0);
+                #pragma unroll
+                for (int k_block = 0; k_block < KBlocks_dKV; ++k_block) {
+                    if (k_block < KBlocks_dKV - 1) {
+                        flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                            smem_B_dK_rs, warp_n_dKV, lane_id_SdP, k_block + 1,
+                            &B_regs_dK[(k_block + 1) * RegsPerKBlockB_dKV]);
+                    }
+                    if constexpr (kStages == 1) {
+                        if (k_block == 0) { load_dO_next(); }
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_dKV; ++m) {
+                        #pragma unroll
+                        for (int n = 0; n < NAtomsN_dKV; ++n) {
+                            int const ns = (m & 1) ? (NAtomsN_dKV - 1 - n) : n;
+                            flash::RawRegsBwd<RegTypeD_SdP, RegNumD_SdP> rD{
+                                &dK_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeC_SdP, RegNumC_SdP> rC{
+                                &dK_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeA_SdP, RegNumA_SdP> rA{reinterpret_cast<RegTypeA_SdP*>(
+                                &A_regs_dK_rs[k_block * RegsPerKBlockA_dKV + m * VRegsPerAtomA_SdP])};
+                            flash::RawRegsBwd<RegTypeB_SdP, RegNumB_SdP> rB{reinterpret_cast<RegTypeB_SdP*>(
+                                &B_regs_dK[k_block * RegsPerKBlockB_dKV + ns * VRegsPerAtomB_SdP])};
+                            cute::detail::explode(MMA_Op_SdP::fma,
+                                rD, cute::make_int_sequence<RegNumD_SdP>{},
+                                rA, cute::make_int_sequence<RegNumA_SdP>{},
+                                rB, cute::make_int_sequence<RegNumB_SdP>{},
+                                rC, cute::make_int_sequence<RegNumC_SdP>{});
+                        }
+                    }
+                }
+            } else {
+                Element const* smem_A_dK = !dKV_swapAB
+                    ? shared_storage.tensors.mainloop.smem_ds.data()
+                    : (shared_storage.tensors.mainloop.smem_q.data()
+                       + (kStages > 1 ? smem_pipe_read : 0) * kBlockM * kHeadDim);
+                Element const* smem_B_dK = !dKV_swapAB
+                    ? (shared_storage.tensors.mainloop.smem_q.data()
+                       + (kStages > 1 ? smem_pipe_read : 0) * kBlockM * kHeadDim)
+                    : shared_storage.tensors.mainloop.smem_ds.data();
+
+                uint32_t A_regs_dK[KBlocks_dKV * RegsPerKBlockA_dKV];
+                uint32_t B_regs_dK[KBlocks_dKV * RegsPerKBlockB_dKV];
+
+                flash::copy_A_smem_to_raw_regs_sm75_trans<kBlockDimA_dKV, kBlockDimA_dKV, kNWarpsM_dKV>(
+                    smem_A_dK, warp_m_dKV, lane_id_SdP, 0, &A_regs_dK[0]);
+                flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                    smem_B_dK, warp_n_dKV, lane_id_SdP, 0, &B_regs_dK[0]);
+
+                float* dK_acc = &tdKrdK(0);
+                #pragma unroll
+                for (int k_block = 0; k_block < KBlocks_dKV; ++k_block) {
+                    if (k_block < KBlocks_dKV - 1) {
+                        flash::copy_A_smem_to_raw_regs_sm75_trans<kBlockDimA_dKV, kBlockDimA_dKV, kNWarpsM_dKV>(
+                            smem_A_dK, warp_m_dKV, lane_id_SdP, k_block + 1,
+                            &A_regs_dK[(k_block + 1) * RegsPerKBlockA_dKV]);
+                        flash::copy_B_smem_to_raw_regs_sm75_trans<kBlockDimB_dKV, kBlockDimB_dKV, kNWarpsN_dKV>(
+                            smem_B_dK, warp_n_dKV, lane_id_SdP, k_block + 1,
+                            &B_regs_dK[(k_block + 1) * RegsPerKBlockB_dKV]);
+                    }
+                    if constexpr (kStages == 1) {
+                        if (k_block == 0) { load_dO_next(); }
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < NAtomsM_dKV; ++m) {
+                        #pragma unroll
+                        for (int n = 0; n < NAtomsN_dKV; ++n) {
+                            int const ns = (m & 1) ? (NAtomsN_dKV - 1 - n) : n;
+                            flash::RawRegsBwd<RegTypeD_SdP, RegNumD_SdP> rD{
+                                &dK_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeC_SdP, RegNumC_SdP> rC{
+                                &dK_acc[m * VRegsPerAtomS + ns * VRegsPerAtomS * NAtomsM_dKV]};
+                            flash::RawRegsBwd<RegTypeA_SdP, RegNumA_SdP> rA{reinterpret_cast<RegTypeA_SdP*>(
+                                &A_regs_dK[k_block * RegsPerKBlockA_dKV + m * VRegsPerAtomA_SdP])};
+                            flash::RawRegsBwd<RegTypeB_SdP, RegNumB_SdP> rB{reinterpret_cast<RegTypeB_SdP*>(
+                                &B_regs_dK[k_block * RegsPerKBlockB_dKV + ns * VRegsPerAtomB_SdP])};
+                            cute::detail::explode(MMA_Op_SdP::fma,
+                                rD, cute::make_int_sequence<RegNumD_SdP>{},
+                                rA, cute::make_int_sequence<RegNumA_SdP>{},
+                                rB, cute::make_int_sequence<RegNumB_SdP>{},
+                                rC, cute::make_int_sequence<RegNumC_SdP>{});
+                        }
+                    }
+                }
+            }
+#endif
             if constexpr (kStages == 1) {
                 __syncthreads();
                 do_mma_dQ(load_Q_next);
