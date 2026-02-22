@@ -1707,6 +1707,12 @@ struct CollectiveMainloopBwdSm80 {
                 flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dQ_swapAB>(
                     tdQrdQ, tdQrdS, tdQrK, tdQsdS, tdQsKt, tiled_mma_dQ,
                     smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt, hook);
+                // if (cute::thread0()) { print_tensor(tdQrdQ); }
+                Tensor tdQrdQ_atomic = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
+                Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
+                static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
+                #pragma unroll
+                for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
 #else
                 // ============================================================
                 // Raw register GEMM: dQ += dS × Kt (or swapped)
@@ -1714,8 +1720,6 @@ struct CollectiveMainloopBwdSm80 {
                 float dQ_regs[TotalRegs_dQ];
                 #pragma unroll
                 for (int i = 0; i < TotalRegs_dQ; ++i) dQ_regs[i] = 0.f;
-                auto tdQrdQ_layout = make_layout(make_shape(Int<VRegsPerAtomS>{}, Int<NAtomsM_dQ>{}, Int<NAtomsN_dQ>{}));
-                Tensor tdQrdQ = make_tensor(make_rmem_ptr(dQ_regs), tdQrdQ_layout);
 
                 // A = dS (non-trans), B = Kt (trans) when !dQ_swapAB
                 // A = Kt (trans), B = dS (non-trans) when dQ_swapAB
@@ -1786,13 +1790,13 @@ struct CollectiveMainloopBwdSm80 {
                         }
                     }
                 }
-#endif
-                // if (cute::thread0()) { print_tensor(tdQrdQ); }
-                Tensor tdQrdQ_atomic = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
-                Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
-                static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
+                // Raw atomicAdd: round-robin with stride NumMmaThreads
+                ElementAccum* dQ_tile_base = &gdQaccum(0, m_block);
                 #pragma unroll
-                for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
+                for (int r = 0; r < TotalRegs_dQ; ++r) {
+                    atomicAdd(dQ_tile_base + thread_idx + r * NumMmaThreads, dQ_regs[r]);
+                }
+#endif
             };
             // If kStages == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
             if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
