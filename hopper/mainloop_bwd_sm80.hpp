@@ -18,7 +18,7 @@
 #include "softmax.h"
 #include "utils.h"
 
-#define FLASH_USE_CUTLASS_TENSOR 0
+#define FLASH_USE_CUTLASS_TENSOR 1
 
 namespace flash {
 
@@ -671,10 +671,13 @@ struct CollectiveMainloopBwdSm80 {
             if (m_block_max <= m_block_min) { return false; }
         }
 
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sdO = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_do.data()), SmemLayoutdO{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
+#endif
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor sQt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQt{});
         Tensor sdOt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_do.data()), SmemLayoutdOt{});
         Tensor sKt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutKt{});
@@ -686,29 +689,35 @@ struct CollectiveMainloopBwdSm80 {
         Tensor sdPsum = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dpsum.data()), SmemLayoutLSE{});
         Tensor sLSEMma = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_lse.data()), SmemLayoutLSEMma{});
         Tensor sdPsumMma = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dpsum.data()), SmemLayoutLSEMma{});
+#endif
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         int bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q), params.shape_Q, params.stride_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdO = make_tensor(make_gmem_ptr(params.ptr_dO), params.shape_dO, params.stride_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
+#endif
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen_q ? bidb : 0);
 
+#if FLASH_USE_CUTLASS_TENSOR
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gdO = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mdO), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)
         Tensor gK = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gV = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (N, K)
         Tensor gLSE = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mLSE), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
         Tensor gdPsum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), mdPsum), select<0>(TileShape_MNK{}), make_coord(_));  // (M, _)
+#endif
         Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
 
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
         auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
+#if FLASH_USE_CUTLASS_TENSOR
         auto gmem_thr0_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(_0{});  // For index calculation
         GmemTiledCopyLSE gmem_tiled_copy_lse;
         auto gmem_thr_copy_lse = gmem_tiled_copy_lse.get_thread_slice(thread_idx);
@@ -726,14 +735,10 @@ struct CollectiveMainloopBwdSm80 {
         // We can reuse r2s_thr_copy_dQaccum for this partitioning
         Tensor tdQgdQaccum = r2s_thr_copy_dQaccum.partition_D(gdQaccum);
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(mdQaccum); printf("\n"); print(gdQaccum_); printf("\n"); print(gdQaccum); printf("\n"); print(tdQgdQaccum); printf("\n"); }
+#endif
 
         TiledMmaSdP tiled_mma_SdP;
-        TiledMmadKV tiled_mma_dKV;
-        TiledMmadQ tiled_mma_dQ;
-
         auto thr_mma_SdP = tiled_mma_SdP.get_thread_slice(thread_idx);
-        auto thr_mma_dKV = tiled_mma_dKV.get_thread_slice(thread_idx);
-        auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
 
         // Allocate "fragments/descriptors"
         // We have to use the templated mma_partition_fragment_AB instead of cute::conditional_return or lambda,
@@ -743,13 +748,20 @@ struct CollectiveMainloopBwdSm80 {
 
         // Copy Atom retiling
         auto smem_copy_atom_SdP_B = cute::conditional_return<MmaSdPEvenN>(SmemCopyAtom{}, SmemCopyAtomHalf{});
+        auto smem_tiled_copy_KV = cute::conditional_return<!SdP_swapAB>(make_tiled_copy_B(smem_copy_atom_SdP_B, tiled_mma_SdP), make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_SdP));
+        auto smem_thr_copy_KV = smem_tiled_copy_KV.get_thread_slice(thread_idx);
+
+#if FLASH_USE_CUTLASS_TENSOR
+        TiledMmadKV tiled_mma_dKV;
+        TiledMmadQ tiled_mma_dQ;
+        auto thr_mma_dKV = tiled_mma_dKV.get_thread_slice(thread_idx);
+        auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
+
         auto smem_tiled_copy_QdO = cute::conditional_return<!SdP_swapAB>(make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_SdP), make_tiled_copy_B(smem_copy_atom_SdP_B, tiled_mma_SdP));
         auto smem_thr_copy_QdO = smem_tiled_copy_QdO.get_thread_slice(thread_idx);
         Tensor tSsQ = smem_thr_copy_QdO.partition_S(sQ);
         Tensor tdPsdO = smem_thr_copy_QdO.partition_S(sdO);
 
-        auto smem_tiled_copy_KV = cute::conditional_return<!SdP_swapAB>(make_tiled_copy_B(smem_copy_atom_SdP_B, tiled_mma_SdP), make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_SdP));
-        auto smem_thr_copy_KV = smem_tiled_copy_KV.get_thread_slice(thread_idx);
         Tensor tSsK = smem_thr_copy_KV.partition_S(sK);
         Tensor tdPsV = smem_thr_copy_KV.partition_S(sV);
 
@@ -808,6 +820,7 @@ struct CollectiveMainloopBwdSm80 {
         Tensor tdOpdO = make_tensor<bool>(make_shape(size<2>(tdOsdO)));
         #pragma unroll
         for (int k = 0; k < size(tdOpdO); ++k) { tdOpdO(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_dO); }
+#endif
 
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
@@ -818,6 +831,9 @@ struct CollectiveMainloopBwdSm80 {
         );
 
         {
+            // Do we need bound check to make sure the row doesn't go above kBlockN
+            static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
             Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
             Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
@@ -832,22 +848,12 @@ struct CollectiveMainloopBwdSm80 {
             for (int k = 0; k < size(tKpK); ++k) { tKpK(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
             #pragma unroll
             for (int k = 0; k < size(tVpV); ++k) { tVpV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_V); }
-            // Do we need bound check to make sure the row doesn't go above kBlockN
-            static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
             // static_assert(EvenN);  // It simplifies the loading of K and V
             // Instead of passing in tKVcKV, we pass in t0KVcKV and subtract the offset from the limit
             // (seqlen_k - n_block * kBlockN). This is because the entries of t0KVcKV are known at compile time.
-            // int const seqlenk_row_limit = -int(get<0>(tKVcKV(_0{}, _0{}, _0{}))) + (EvenN
-            //     ? seqlen_info.seqlen_k - n_block * kBlockN
-            //     : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN));
-            // // Need Clear_OOB_MN to be true here since the gemm will sum over the kBlockN dimension
-            // flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
-            //     gmem_tiled_copy_QKV, tVgV, tVsV, t0KVcKV, tKVpKV, seqlenk_row_limit);
             int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
-#if FLASH_USE_CUTLASS_TENSOR
             #pragma unroll
             for (int m = 0; m < size<1>(tVsV); ++m) {
-                // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked
                 if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN) {
                     bool const predicate_n = get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
                     #pragma unroll
@@ -856,85 +862,7 @@ struct CollectiveMainloopBwdSm80 {
                     }
                 }
             }
-#else
-            {
-                // Raw index calculation for V gmem→smem copy.
-                // CuTe equivalent: cute::copy(gmem_tiled_copy_QKV.with(pred), tVgV(_, m, k), tVsV(_, m, k))
-                // Uses SM80_CP_ASYNC_CACHEGLOBAL semantics: OOB positions are NOT zero-filled.
-                static constexpr int num_n_elements = kBlockN / kThreadRows;    // CuTe: size<1>(tVsV)
-                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;   // CuTe: size<2>(tVsV)
-                static constexpr int num_vec_copies = kGmemElemsPerLoad;        // CuTe: size<0>(tVsV)
-
-                int const thread_row = thread_idx / kGmemThreadsPerRow;
-                int const thread_col = thread_idx % kGmemThreadsPerRow;
-
-                // Gmem base pointer for V tile at (n_block), including head/batch/varlen offsets
-                // CuTe: raw_pointer_cast(gV.data())
-                int const v_row_stride = static_cast<int>(get<0>(params.stride_V));
-                Element const* gmem_V_ptr = params.ptr_V
-                    + seqlen_info.offset_k * v_row_stride
-                    + bidh_kv * static_cast<int>(get<2>(params.stride_V))
-                    + (!is_varlen_k ? bidb : 0) * static_cast<int>(get<3>(params.stride_V))
-                    + n_block * kBlockN * v_row_stride;
-                int const thread_base_gmem = thread_row * v_row_stride
-                                           + thread_col * kGmemElemsPerLoad;
-
-                // Smem base pointer for V
-                // CuTe: raw_pointer_cast(sV.data())
-                Element* smem_V_ptr = shared_storage.tensors.mainloop.smem_v.data();
-
-                // K-dimension predicates: which K-chunks are within valid head dimension
-                // CuTe: tVpV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_V)
-                int const headdim_V = get<1>(params.shape_V);
-                bool tVpV_raw[num_k_elements];
-                #pragma unroll
-                for (int kk = 0; kk < num_k_elements; ++kk) {
-                    tVpV_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_V;
-                }
-
-                // N-dimension limit: how many rows are valid in this tile
-                // CuTe: seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}))
-                int const remaining_seqlen = seqlen_k - n_block * kBlockN;
-
-                #pragma unroll
-                for (int m = 0; m < num_n_elements; ++m) {
-                    // CuTe: EvenN || m < size<1>(tVsV) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN
-                    bool row_within_tile;
-                    if constexpr (EvenN) {
-                        row_within_tile = true;
-                    } else {
-                        row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
-                    }
-
-                    if (row_within_tile) {
-                        int const actual_row = thread_row + m * kThreadRows;
-                        // CuTe: get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit
-                        bool const predicate_n = actual_row < remaining_seqlen;
-
-                        #pragma unroll
-                        for (int kk = 0; kk < num_k_elements; ++kk) {
-                            bool const predicate_both = tVpV_raw[kk] && predicate_n;
-
-                            #pragma unroll
-                            for (int vec = 0; vec < num_vec_copies; ++vec) {
-                                int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
-
-                                int const smem_idx = actual_row * kHeadDim + col;
-
-                                if (predicate_both) {
-                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows * v_row_stride + kk * kBlockKGmem;
-                                    smem_V_ptr[smem_idx] = gmem_V_ptr[gmem_idx];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-#endif
             if constexpr (V_in_regs) { flash::cp_async_fence(); }
-            // flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
-            //     gmem_tiled_copy_QKV, tKgK, tKsK, t0KVcKV, tKVpKV, seqlenk_row_limit);
-#if FLASH_USE_CUTLASS_TENSOR
             #pragma unroll
             for (int m = 0; m < size<1>(tKsK); ++m) {
                 if (EvenN || m < size<1>(tKsK) - 1 || get<0>(tKVcKV(_0{}, m, _0{})) < kBlockN) {
@@ -947,6 +875,68 @@ struct CollectiveMainloopBwdSm80 {
             }
 #else
             {
+                // Raw index calculation for V gmem→smem copy.
+                static constexpr int num_n_elements = kBlockN / kThreadRows;
+                static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
+                static constexpr int num_vec_copies = kGmemElemsPerLoad;
+
+                int const thread_row = thread_idx / kGmemThreadsPerRow;
+                int const thread_col = thread_idx % kGmemThreadsPerRow;
+
+                int const v_row_stride = static_cast<int>(get<0>(params.stride_V));
+                Element const* gmem_V_ptr = params.ptr_V
+                    + seqlen_info.offset_k * v_row_stride
+                    + bidh_kv * static_cast<int>(get<2>(params.stride_V))
+                    + (!is_varlen_k ? bidb : 0) * static_cast<int>(get<3>(params.stride_V))
+                    + n_block * kBlockN * v_row_stride;
+                int const thread_base_gmem = thread_row * v_row_stride
+                                           + thread_col * kGmemElemsPerLoad;
+
+                Element* smem_V_ptr = shared_storage.tensors.mainloop.smem_v.data();
+
+                int const headdim_V = get<1>(params.shape_V);
+                bool tVpV_raw[num_k_elements];
+                #pragma unroll
+                for (int kk = 0; kk < num_k_elements; ++kk) {
+                    tVpV_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_V;
+                }
+
+                int const remaining_seqlen = seqlen_k - n_block * kBlockN;
+
+                #pragma unroll
+                for (int m = 0; m < num_n_elements; ++m) {
+                    bool row_within_tile;
+                    if constexpr (EvenN) {
+                        row_within_tile = true;
+                    } else {
+                        row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
+                    }
+
+                    if (row_within_tile) {
+                        int const actual_row = thread_row + m * kThreadRows;
+                        bool const predicate_n = actual_row < remaining_seqlen;
+
+                        #pragma unroll
+                        for (int kk = 0; kk < num_k_elements; ++kk) {
+                            bool const predicate_both = tVpV_raw[kk] && predicate_n;
+
+                            #pragma unroll
+                            for (int vec = 0; vec < num_vec_copies; ++vec) {
+                                int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                                int const smem_idx = actual_row * kHeadDim + col;
+
+                                if (predicate_both) {
+                                    int const gmem_idx = thread_base_gmem + vec + m * kThreadRows * v_row_stride + kk * kBlockKGmem;
+                                    smem_V_ptr[smem_idx] = gmem_V_ptr[gmem_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if constexpr (V_in_regs) { flash::cp_async_fence(); }
+            {
+                // Raw index calculation for K gmem→smem copy.
                 static constexpr int num_n_elements = kBlockN / kThreadRows;
                 static constexpr int num_k_elements = kHeadDim / kBlockKGmem;
                 static constexpr int num_vec_copies = kGmemElemsPerLoad;
@@ -994,7 +984,6 @@ struct CollectiveMainloopBwdSm80 {
                             #pragma unroll
                             for (int vec = 0; vec < num_vec_copies; ++vec) {
                                 int const col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
-
                                 int const smem_idx = actual_row * kHeadDim + col;
 
                                 if (predicate_both) {
@@ -1443,6 +1432,7 @@ struct CollectiveMainloopBwdSm80 {
                 }
             }
 #endif
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tSsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
             if constexpr (!ShuffleLSE) {
                 cute::copy(tSsLSE(_, kStages > 1 ? smem_pipe_read : 0), tLSErLSE);
@@ -1472,6 +1462,57 @@ struct CollectiveMainloopBwdSm80 {
                     scores(mi, ni) = exp2f(scores(mi, ni) * params.softmax_scale_log2 - lse_scaled);
                 }
             }
+#else
+            // Raw: load LSE from shared memory
+            static constexpr int nrow_scores = !SdP_swapAB ? 2 * NAtomsM_SdP : 2 * NAtomsN_SdP;
+            static constexpr int lse_smem_stride = cute::round_up(kBlockM, 64);
+            float lse_raw[nrow_scores];
+            {
+                ElementAccum const* smem_lse_ptr = shared_storage.tensors.mainloop.smem_lse.data();
+                int const lse_stage = kStages > 1 ? smem_pipe_read : 0;
+                int const groupID = lane_id_SdP / 4;
+                int const tidInGroup = lane_id_SdP % 4;
+                #pragma unroll
+                for (int mi = 0; mi < nrow_scores; ++mi) {
+                    int physical_row;
+                    if constexpr (!SdP_swapAB) {
+                        physical_row = (mi / 2) * 16 * kNWarpsM_SdP + warp_m_SdP * 16 + groupID + (mi % 2) * 8;
+                    } else {
+                        physical_row = (mi / 2) * 8 * kNWarpsN_SdP + warp_n_SdP * 8 + tidInGroup * 2 + (mi % 2);
+                    }
+                    lse_raw[mi] = smem_lse_ptr[physical_row + lse_stage * lse_smem_stride];
+                }
+            }
+            // Raw softcap
+            if constexpr (Has_softcap) {
+                #pragma unroll
+                for (int i = 0; i < TotalSRegs; ++i) {
+                    S_regs[i] = cutlass::fast_tanh(S_regs[i] * params.softcap_val);
+                }
+            }
+            // dtanh must be computed before masking (1 - tanh^2 of pre-mask values)
+            float dtanh_raw[TotalSRegs];
+            if constexpr (Has_softcap) {
+                #pragma unroll
+                for (int i = 0; i < TotalSRegs; ++i) {
+                    dtanh_raw[i] = 1.f - S_regs[i] * S_regs[i];
+                }
+            }
+            mask_fn(tSrS, m_block);
+            // Raw softmax: exp2f(score * scale - lse) per row
+            #pragma unroll
+            for (int m = 0; m < NAtomsM_SdP; ++m) {
+                #pragma unroll
+                for (int n = 0; n < NAtomsN_SdP; ++n) {
+                    #pragma unroll
+                    for (int v = 0; v < VRegsPerAtomS; ++v) {
+                        int const idx = v + m * VRegsPerAtomS + n * VRegsPerAtomS * NAtomsM_SdP;
+                        int const mi = !SdP_swapAB ? (v / 2) + m * 2 : (v % 2) + n * 2;
+                        S_regs[idx] = exp2f(S_regs[idx] * params.softmax_scale_log2 - lse_raw[mi]);
+                    }
+                }
+            }
+#endif
 
 #if FLASH_USE_CUTLASS_TENSOR
             Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
@@ -1549,6 +1590,7 @@ struct CollectiveMainloopBwdSm80 {
                 }
             }
 #endif
+#if FLASH_USE_CUTLASS_TENSOR
             Tensor tLSErdPsum = cute::conditional_return<!ShuffledPsum>(make_fragment_like(tSsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
             if constexpr (!ShuffledPsum) {
                 cute::copy(tSsdPsum(_, kStages_dO > 1 ? smem_pipe_read_do_cur : 0), tLSErdPsum);
@@ -1573,8 +1615,44 @@ struct CollectiveMainloopBwdSm80 {
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
                 }
             }
+#else
+            // Raw: load dPsum from shared memory (same layout as LSE)
+            float dpsum_raw[nrow_scores];
+            {
+                ElementAccum const* smem_dpsum_ptr = shared_storage.tensors.mainloop.smem_dpsum.data();
+                int const dpsum_stage = kStages_dO > 1 ? smem_pipe_read_do_cur : 0;
+                int const groupID = lane_id_SdP / 4;
+                int const tidInGroup = lane_id_SdP % 4;
+                #pragma unroll
+                for (int mi = 0; mi < nrow_scores; ++mi) {
+                    int physical_row;
+                    if constexpr (!SdP_swapAB) {
+                        physical_row = (mi / 2) * 16 * kNWarpsM_SdP + warp_m_SdP * 16 + groupID + (mi % 2) * 8;
+                    } else {
+                        physical_row = (mi / 2) * 8 * kNWarpsN_SdP + warp_n_SdP * 8 + tidInGroup * 2 + (mi % 2);
+                    }
+                    dpsum_raw[mi] = smem_dpsum_ptr[physical_row + dpsum_stage * lse_smem_stride];
+                }
+            }
+
+            // Raw dS computation: dS = P * (dP - dPsum), optionally scaled by dtanh
+            #pragma unroll
+            for (int m = 0; m < NAtomsM_SdP; ++m) {
+                #pragma unroll
+                for (int n = 0; n < NAtomsN_SdP; ++n) {
+                    #pragma unroll
+                    for (int v = 0; v < VRegsPerAtomS; ++v) {
+                        int const idx = v + m * VRegsPerAtomS + n * VRegsPerAtomS * NAtomsM_SdP;
+                        int const mi = !SdP_swapAB ? (v / 2) + m * 2 : (v % 2) + n * 2;
+                        dP_regs[idx] = S_regs[idx] * (dP_regs[idx] - dpsum_raw[mi]);
+                        if constexpr (Has_softcap) { dP_regs[idx] *= dtanh_raw[idx]; }
+                    }
+                }
+            }
+#endif
             // if (cute::thread0()) { print_tensor(dS); }
 
+#if FLASH_USE_CUTLASS_TENSOR
             // Convert scores from fp32 to fp16/bf16
             Tensor rP = make_tensor_like<Element>(tSrS);
             flash::convert_type_out(tSrS, rP);
@@ -1588,6 +1666,67 @@ struct CollectiveMainloopBwdSm80 {
             // For hdim 64, It's faster to write to smem_dS first before the dV gemm
             Tensor tdSadS = r2s_thr_copy_PdS.retile_S(rdS);   // ((Atom,AtomNum), MMA_N, MMA_N)
             cute::copy(r2s_tiled_copy_PdS, tdSadS, tdSsdS);
+#else
+            // Raw conversion: S accumulator (fp32) → P (fp16/bf16)
+            Element P_raw[TotalSRegs];
+            {
+                cutlass::NumericArrayConverter<Element, float, VRegsPerAtomS> cvt;
+                #pragma unroll
+                for (int i = 0; i < TotalSRegs; i += VRegsPerAtomS) {
+                    auto dst = cvt(*reinterpret_cast<cutlass::Array<float, VRegsPerAtomS> const*>(&S_regs[i]));
+                    memcpy(&P_raw[i], &dst, VRegsPerAtomS * sizeof(Element));
+                }
+            }
+            if constexpr (!Mma_dKV_is_RS) {
+                // Write P to smem_p: MMA C register (v, m, n) → 2D position
+                Element* smem_P = shared_storage.tensors.mainloop.smem_p.data();
+                int const groupID_P = lane_id_SdP / 4;
+                int const tidInGroup_P = lane_id_SdP % 4;
+                #pragma unroll
+                for (int m = 0; m < NAtomsM_SdP; ++m) {
+                    #pragma unroll
+                    for (int n = 0; n < NAtomsN_SdP; ++n) {
+                        int const base_row = m * 16 * kNWarpsM_SdP + warp_m_SdP * 16;
+                        int const base_col = n * 8 * kNWarpsN_SdP + warp_n_SdP * 8 + tidInGroup_P * 2;
+                        int const reg_base = m * VRegsPerAtomS + n * VRegsPerAtomS * NAtomsM_SdP;
+                        *reinterpret_cast<uint32_t*>(&smem_P[(base_row + groupID_P) * kBlockDimB_SdP + base_col]) =
+                            *reinterpret_cast<uint32_t const*>(&P_raw[reg_base]);
+                        *reinterpret_cast<uint32_t*>(&smem_P[(base_row + groupID_P + 8) * kBlockDimB_SdP + base_col]) =
+                            *reinterpret_cast<uint32_t const*>(&P_raw[reg_base + 2]);
+                    }
+                }
+            }
+            // Raw conversion: dP accumulator (fp32) → dS (fp16/bf16)
+            Element dS_raw[TotalSRegs];
+            {
+                cutlass::NumericArrayConverter<Element, float, VRegsPerAtomS> cvt;
+                #pragma unroll
+                for (int i = 0; i < TotalSRegs; i += VRegsPerAtomS) {
+                    auto dst = cvt(*reinterpret_cast<cutlass::Array<float, VRegsPerAtomS> const*>(&dP_regs[i]));
+                    memcpy(&dS_raw[i], &dst, VRegsPerAtomS * sizeof(Element));
+                }
+            }
+            if constexpr (!Mma_dKV_is_RS) { __syncthreads(); }  // Make sure P is written
+            {
+                // Write dS to smem_ds
+                Element* smem_dS = shared_storage.tensors.mainloop.smem_ds.data();
+                int const groupID_dS = lane_id_SdP / 4;
+                int const tidInGroup_dS = lane_id_SdP % 4;
+                #pragma unroll
+                for (int m = 0; m < NAtomsM_SdP; ++m) {
+                    #pragma unroll
+                    for (int n = 0; n < NAtomsN_SdP; ++n) {
+                        int const base_row = m * 16 * kNWarpsM_SdP + warp_m_SdP * 16;
+                        int const base_col = n * 8 * kNWarpsN_SdP + warp_n_SdP * 8 + tidInGroup_dS * 2;
+                        int const reg_base = m * VRegsPerAtomS + n * VRegsPerAtomS * NAtomsM_SdP;
+                        *reinterpret_cast<uint32_t*>(&smem_dS[(base_row + groupID_dS) * kBlockDimB_SdP + base_col]) =
+                            *reinterpret_cast<uint32_t const*>(&dS_raw[reg_base]);
+                        *reinterpret_cast<uint32_t*>(&smem_dS[(base_row + groupID_dS + 8) * kBlockDimB_SdP + base_col]) =
+                            *reinterpret_cast<uint32_t const*>(&dS_raw[reg_base + 2]);
+                    }
+                }
+            }
+#endif
 
 #if FLASH_USE_CUTLASS_TENSOR
             Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
@@ -1606,8 +1745,8 @@ struct CollectiveMainloopBwdSm80 {
             // Raw register GEMM: dV += Pt × dOt (or swapped)
             // ============================================================
             if constexpr (Mma_dKV_is_RS) {
-                // RS: A = rP already in registers, B = dOt from smem (transposed)
-                uint32_t* A_regs_dV_rs = reinterpret_cast<uint32_t*>(&rP(0));
+                // RS: A = P_raw already in registers, B = dOt from smem (transposed)
+                uint32_t* A_regs_dV_rs = reinterpret_cast<uint32_t*>(P_raw);
                 Element const* smem_B_dV_rs = shared_storage.tensors.mainloop.smem_do.data()
                     + (kStages_dO > 1 ? smem_pipe_read_do_cur : 0) * kBlockM * kHeadDim;
 
@@ -1817,8 +1956,8 @@ struct CollectiveMainloopBwdSm80 {
             // Raw register GEMM: dK += dSt × Qt (or swapped)
             // ============================================================
             if constexpr (Mma_dKV_is_RS) {
-                // RS: A = rdS already in registers, B = Qt from smem (transposed)
-                uint32_t* A_regs_dK_rs = reinterpret_cast<uint32_t*>(&rdS(0));
+                // RS: A = dS_raw already in registers, B = Qt from smem (transposed)
+                uint32_t* A_regs_dK_rs = reinterpret_cast<uint32_t*>(dS_raw);
                 Element const* smem_B_dK_rs = shared_storage.tensors.mainloop.smem_q.data()
                     + (kStages > 1 ? smem_pipe_read : 0) * kBlockM * kHeadDim;
 
