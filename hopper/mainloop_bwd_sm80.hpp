@@ -18,7 +18,7 @@
 #include "softmax.h"
 #include "utils.h"
 
-#define FLASH_USE_CUTLASS_TENSOR 1
+#define FLASH_USE_CUTLASS_TENSOR 0
 
 namespace flash {
 
@@ -675,9 +675,7 @@ struct CollectiveMainloopBwdSm80 {
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sdO = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_do.data()), SmemLayoutdO{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
-#endif
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
-#if FLASH_USE_CUTLASS_TENSOR
         Tensor sQt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQt{});
         Tensor sdOt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_do.data()), SmemLayoutdOt{});
         Tensor sKt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutKt{});
@@ -715,9 +713,9 @@ struct CollectiveMainloopBwdSm80 {
 #endif
         Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
 
+#if FLASH_USE_CUTLASS_TENSOR
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
         auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
-#if FLASH_USE_CUTLASS_TENSOR
         auto gmem_thr0_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(_0{});  // For index calculation
         GmemTiledCopyLSE gmem_tiled_copy_lse;
         auto gmem_thr_copy_lse = gmem_tiled_copy_lse.get_thread_slice(thread_idx);
@@ -735,7 +733,6 @@ struct CollectiveMainloopBwdSm80 {
         // We can reuse r2s_thr_copy_dQaccum for this partitioning
         Tensor tdQgdQaccum = r2s_thr_copy_dQaccum.partition_D(gdQaccum);
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(mdQaccum); printf("\n"); print(gdQaccum_); printf("\n"); print(gdQaccum); printf("\n"); print(tdQgdQaccum); printf("\n"); }
-#endif
 
         TiledMmaSdP tiled_mma_SdP;
         auto thr_mma_SdP = tiled_mma_SdP.get_thread_slice(thread_idx);
@@ -751,7 +748,6 @@ struct CollectiveMainloopBwdSm80 {
         auto smem_tiled_copy_KV = cute::conditional_return<!SdP_swapAB>(make_tiled_copy_B(smem_copy_atom_SdP_B, tiled_mma_SdP), make_tiled_copy_A(SmemCopyAtom{}, tiled_mma_SdP));
         auto smem_thr_copy_KV = smem_tiled_copy_KV.get_thread_slice(thread_idx);
 
-#if FLASH_USE_CUTLASS_TENSOR
         TiledMmadKV tiled_mma_dKV;
         TiledMmadQ tiled_mma_dQ;
         auto thr_mma_dKV = tiled_mma_dKV.get_thread_slice(thread_idx);
@@ -999,6 +995,7 @@ struct CollectiveMainloopBwdSm80 {
             flash::cp_async_fence();
         }
 
+#if FLASH_USE_CUTLASS_TENSOR
         if constexpr (V_in_regs) {
             flash::cp_async_wait<1>();
             __syncthreads();
@@ -1007,6 +1004,7 @@ struct CollectiveMainloopBwdSm80 {
             cute::copy(smem_tiled_copy_KV, tdPsV_copy_view, tdPrV_copy_view);
             __syncthreads();  // Sync to avoid loading Q to smem_q, which overlaps with smem_v
         }
+#endif
 
         // Do we need bound check to make sure the row doesn't go above kBlockM
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1533,7 +1531,6 @@ struct CollectiveMainloopBwdSm80 {
             float dP_regs[TotalSRegs];
             #pragma unroll
             for (int i = 0; i < TotalSRegs; ++i) dP_regs[i] = 0.f;
-            Tensor tdPrdP = make_tensor(make_rmem_ptr(dP_regs), tSrS_layout);
             int smem_pipe_read_do_cur = Q_dO_same_stages ? smem_pipe_read : smem_pipe_read_do;
             flash::cp_async_wait<(kStages_dO > 1) ? 1 : 0>();
             __syncthreads();
