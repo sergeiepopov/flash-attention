@@ -12,16 +12,18 @@
 //
 // Algorithm (per K/V block):
 //   1. Load K, V to shared memory; initialize tdKrdK=0, tdVrdV=0 accumulators
-//   2. For each Q block (m_block):
-//      a. Load Q, dO, LSE_log2, dPsum to shared memory
-//      b. S_regs  = Q × K^T                         (scores, fp32)
-//      c. S_regs  = exp2(S_regs * scale_log2 - LSE) (softmax → P in-place)
-//      d. dP_regs = dO × V^T                        (fp32)
-//      e. dP_regs = P * (dP_regs - dPsum)           (→ dS in-place)
-//      f. Convert P→f16 (P_raw), write to smem; tdVrdV += P^T × dO
-//      g. Convert dS→f16 (dS_raw), write to smem; tdKrdK += dS^T × Q
+//   2. Pre-load Q, LSE, dO, dPsum for the first m_block
+//   3. For each Q block (m_block):
+//      a. S_regs  = Q × K^T                         (scores, fp32)
+//      b. S_regs  = exp2(S_regs * scale_log2 - LSE) (softmax → P in-place)
+//      c. dP_regs = dO × V^T                        (fp32)
+//      d. dP_regs = P * (dP_regs - dPsum)           (→ dS in-place)
+//      e. Convert P→f16 (P_raw), write to smem; tdVrdV += P^T × dO
+//      f. Convert dS→f16 (dS_raw), write to smem; tdKrdK += dS^T × Q
+//      g. Load dO, dPsum for next m_block  (smem_do/dpsum free after dK)
 //      h. dQ_regs = dS × K  (atomicAdd to global fp32 buffer)
-//   3. Scale tdKrdK by softmax_scale; write dK, dV to global memory (f16)
+//      i. Load Q, LSE for next m_block     (smem_q/lse free after dQ)
+//   4. Scale tdKrdK by softmax_scale; write dK, dV to global memory (f16)
 //
 // Dispatch: (ceil(seqlen_k / kBlockN), num_heads_k, batch_size)
 // Workgroup: NumMmaThreads invocations
@@ -168,23 +170,10 @@ void atomicAddF32(uint index, float val) {
 #define MASK_LOCAL_ONLY    2
 
 // ============================================================================
-// bwd_step — one iteration of the backward pass inner loop.
-// Mirrors the bwd_step lambda in mainloop_bwd_sm80.hpp.
+// load_Q_LSE — load Q tile and LSE vector for a given m_block into shared
+// memory.  Mirrors the load_Q_LSE lambda in mainloop_bwd_sm80.hpp.
 // ============================================================================
-void bwd_step(
-    uint m_block, uint n_block, uint bidh, uint bidb, uint thread_idx,
-    int mask_mode,
-    inout float dK_acc[TILE_ROWS][TILE_COLS_D],
-    inout float dV_acc[TILE_ROWS][TILE_COLS_D]
-) {
-    uint tm   = (thread_idx / TPR_MN) * TILE_MN;
-    uint tn   = (thread_idx % TPR_MN) * TILE_MN;
-    uint tn_d = (thread_idx / TPR_D)  * TILE_ROWS;
-    uint td   = (thread_idx % TPR_D)  * TILE_COLS_D;
-    uint tm_d = (thread_idx / TPR_D)  * TILE_ROWS;
-    uint td_q = (thread_idx % TPR_D)  * TILE_COLS_D;
-
-    // -- load_Q_LSE --------------------------------------------------------
+void load_Q_LSE(uint m_block, uint bidh, uint bidb, uint thread_idx) {
     {
         const uint num_m_elements = kBlockM / kThreadRows;
         const uint num_k_elements = kHeadDim / kBlockKGmem;
@@ -243,9 +232,13 @@ void bwd_step(
                 smem_lse[lse_base + v] = buf_LSE.d[gmem_LSE_ptr + lse_base + v];
         }
     }
+}
 
-    // -- load_dO_dPsum -----------------------------------------------------
-    {
+// ============================================================================
+// load_dO_dPsum — load dO tile and dPsum vector for a given m_block into
+// shared memory.  Mirrors the load_dO_dPsum lambda in mainloop_bwd_sm80.hpp.
+// ============================================================================
+void load_dO_dPsum(uint m_block, uint bidh, uint bidb, uint thread_idx) {
         const uint num_m_elements = kBlockM / kThreadRows;
         const uint num_k_elements = kHeadDim / kBlockKGmem;
         const uint num_vec_copies = kGmemElemsPerLoad;
@@ -303,8 +296,27 @@ void bwd_step(
                 smem_dpsum[lse_base + v] = buf_dPsum.d[gmem_dPsum_ptr + lse_base + v];
         }
     }
+}
 
-    barrier();
+// ============================================================================
+// bwd_step — one iteration of the backward pass inner loop.
+// Mirrors the bwd_step lambda in mainloop_bwd_sm80.hpp.
+// Assumes Q, LSE, dO, dPsum are already loaded into shared memory.
+// At the end, loads Q/LSE and dO/dPsum for the next m_block (if any),
+// mirroring the load_Q_next / load_dO_next pattern in the CUDA code.
+// ============================================================================
+void bwd_step(
+    uint m_block, uint n_block, uint bidh, uint bidb, uint thread_idx,
+    int mask_mode, int m_block_max,
+    inout float dK_acc[TILE_ROWS][TILE_COLS_D],
+    inout float dV_acc[TILE_ROWS][TILE_COLS_D]
+) {
+    uint tm   = (thread_idx / TPR_MN) * TILE_MN;
+    uint tn   = (thread_idx % TPR_MN) * TILE_MN;
+    uint tn_d = (thread_idx / TPR_D)  * TILE_ROWS;
+    uint td   = (thread_idx % TPR_D)  * TILE_COLS_D;
+    uint tm_d = (thread_idx / TPR_D)  * TILE_ROWS;
+    uint td_q = (thread_idx % TPR_D)  * TILE_COLS_D;
 
     // -- S = Q × K^T -------------------------------------------------------
     float S_regs[TILE_MN][TILE_MN];
@@ -431,6 +443,12 @@ void bwd_step(
         }
     }
 
+    // -- load_dO_next: smem_do/dpsum are free after dK (mirrors CUDA) -------
+    if (int(m_block) + 1 < m_block_max) {
+        load_dO_dPsum(m_block + 1, bidh, bidb, thread_idx);
+    }
+    barrier();
+
     // -- dQ += dS × K (atomicAdd) -------------------------------------------
     float dQ_regs[TILE_ROWS][TILE_COLS_D];
     for (uint i = 0; i < TILE_ROWS; ++i)
@@ -461,6 +479,10 @@ void bwd_step(
         }
     }
 
+    // -- load_Q_next: smem_q/lse are free after dQ (mirrors CUDA) -----------
+    if (int(m_block) + 1 < m_block_max) {
+        load_Q_LSE(m_block + 1, bidh, bidb, thread_idx);
+    }
     barrier();
 }
 
@@ -663,6 +685,14 @@ void main() {
     int m_block = m_block_min;
 
     // ========================================================================
+    // Pre-load Q, LSE, dO, dPsum for the first m_block — mirrors the
+    // initial prefetch in mainloop_bwd_sm80.hpp (before the bwd_step loop).
+    // ========================================================================
+    load_Q_LSE(uint(m_block_min), bidh, bidb, thread_idx);
+    load_dO_dPsum(uint(m_block_min), bidh, bidb, thread_idx);
+    barrier();
+
+    // ========================================================================
     // Three-loop structure mirroring mainloop_bwd_sm80.hpp.
     //
     // The m_block range is split so that the expensive causal/local masking
@@ -674,21 +704,21 @@ void main() {
 #if IS_CAUSAL || IS_LOCAL
     for (; m_block < m_block_masking_max; ++m_block) {
         bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
-                 MASK_CAUSAL_LOCAL, dK_acc, dV_acc);
+                 MASK_CAUSAL_LOCAL, m_block_max, dK_acc, dV_acc);
     }
 #endif
 
     // Loop 2: middle region — seqlen-k mask only
     for (; m_block < m_block_max_before_local_mask; ++m_block) {
         bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
-                 MASK_SEQLENK_ONLY, dK_acc, dV_acc);
+                 MASK_SEQLENK_ONLY, m_block_max, dK_acc, dV_acc);
     }
 
     // Loop 3: local masking only (far side of the local window)
 #if IS_LOCAL
     for (; m_block < m_block_max; ++m_block) {
         bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
-                 MASK_LOCAL_ONLY, dK_acc, dV_acc);
+                 MASK_LOCAL_ONLY, m_block_max, dK_acc, dV_acc);
     }
 #endif
 
