@@ -1316,9 +1316,6 @@ struct CollectiveMainloopBwdSm80 {
             float S_regs[TotalSRegs];
             #pragma unroll
             for (int i = 0; i < TotalSRegs; ++i) S_regs[i] = 0.f;
-            auto tSrS_layout = make_layout(make_shape(Int<VRegsPerAtomS>{}, Int<NAtomsM_SdP>{}, Int<NAtomsN_SdP>{}));
-            Tensor tSrS = make_tensor(make_rmem_ptr(S_regs), tSrS_layout);
-
             flash::cp_async_wait<(kStages > 1) ? 1 : 0>();
             __syncthreads();
 
@@ -1496,7 +1493,7 @@ struct CollectiveMainloopBwdSm80 {
                     dtanh_raw[i] = 1.f - S_regs[i] * S_regs[i];
                 }
             }
-            mask_fn(tSrS, m_block);
+            mask_fn(S_regs, m_block);
             // Raw softmax: exp2f(score * scale - lse) per row
             #pragma unroll
             for (int m = 0; m < NAtomsM_SdP; ++m) {
@@ -2065,7 +2062,13 @@ struct CollectiveMainloopBwdSm80 {
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
         if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            auto mask_fn = [&](auto& tSrS, int m_block) {
+                if constexpr (std::is_array_v<std::remove_reference_t<decltype(tSrS)>>) {
+                    mask.template apply_raw<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                } else {
+                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                }
+            };
             int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
@@ -2078,14 +2081,26 @@ struct CollectiveMainloopBwdSm80 {
             ? m_block_max
             : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
-        auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+        auto mask_fn = [&](auto& tSrS, int m_block) {
+            if constexpr (std::is_array_v<std::remove_reference_t<decltype(tSrS)>>) {
+                mask.template apply_raw<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block);
+            } else {
+                mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block);
+            }
+        };
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);
         }
 
         if constexpr (Is_local && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+            auto mask_fn = [&](auto& tSrS, int m_block) {
+                if constexpr (std::is_array_v<std::remove_reference_t<decltype(tSrS)>>) {
+                    mask.template apply_raw<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                } else {
+                    mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                }
+            };
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < m_block_max; ++m_block) {
                 bwd_step(m_block, mask_fn);

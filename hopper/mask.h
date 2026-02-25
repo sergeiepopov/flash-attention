@@ -161,6 +161,73 @@ struct Mask {
         }
     };
 
+    // Raw-register version: applies masking directly to the flat accumulator array S_regs[]
+    // without requiring CuTe tensor wrappers. The register-to-tile-position mapping follows
+    // the SM75/SM80 m16n8 MMA accumulator layout.
+    template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false>
+    CUTLASS_DEVICE
+    void apply_raw(float* S_regs, int const m_block, int const n_block) const {
+        static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
+        static_assert(!PackGQA, "apply_raw does not support PackGQA");
+        if constexpr (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
+
+        using ThrLayoutVMNK = typename TiledMma::ThrLayoutVMNK;
+        static constexpr int kNWarpsM = CUTE_STATIC_V(size<1>(ThrLayoutVMNK{}));
+        static constexpr int kNWarpsN = CUTE_STATIC_V(size<2>(ThrLayoutVMNK{}));
+        static constexpr int AtomN = 8;
+        static constexpr int kBlockDimA = !SwapAB ? kBlockM : kBlockN;
+        static constexpr int kBlockDimB = !SwapAB ? kBlockN : kBlockM;
+        static constexpr int NAtomsM = kBlockDimA / (16 * kNWarpsM);
+        static constexpr int NAtomsN = kBlockDimB / (AtomN * kNWarpsN);
+        static constexpr int VRegsPerAtom = 4;
+
+        int const warp_id = thread_idx / 32;
+        int const lane_id = thread_idx % 32;
+        int const warp_m = warp_id % kNWarpsM;
+        int const warp_n = warp_id / kNWarpsM;
+        int const groupID = lane_id / 4;
+        int const tidInGroup = lane_id % 4;
+
+        #pragma unroll
+        for (int m = 0; m < NAtomsM; ++m) {
+            #pragma unroll
+            for (int n = 0; n < NAtomsN; ++n) {
+                #pragma unroll
+                for (int v = 0; v < VRegsPerAtom; ++v) {
+                    int const idx = v + m * VRegsPerAtom + n * VRegsPerAtom * NAtomsM;
+                    int q_row, k_col;
+                    if constexpr (!SwapAB) {
+                        q_row = m * 16 * kNWarpsM + warp_m * 16 + groupID + (v / 2) * 8;
+                        k_col = n * AtomN * kNWarpsN + warp_n * AtomN + tidInGroup * 2 + (v % 2);
+                    } else {
+                        k_col = m * 16 * kNWarpsM + warp_m * 16 + groupID + (v / 2) * 8;
+                        q_row = n * AtomN * kNWarpsN + warp_n * AtomN + tidInGroup * 2 + (v % 2);
+                    }
+                    int const abs_q = q_row + m_block * kBlockM;
+                    int const abs_k = k_col + n_block * kBlockN;
+
+                    bool masked = false;
+                    if constexpr (Seqlenk_mask) {
+                        masked |= (abs_k >= seqlen_k);
+                    }
+                    if constexpr (Causal_mask) {
+                        int const causal_offset = seqlen_k - seqlen_q;
+                        masked |= (abs_k > abs_q + causal_offset);
+                    }
+                    if constexpr (Local_mask) {
+                        int const causal_offset = seqlen_k - seqlen_q;
+                        masked |= (abs_k > abs_q + causal_offset + window_size_right);
+                        if (abs_k < abs_q + causal_offset - window_size_left
+                            && abs_k >= sink_token_length) {
+                            masked = true;
+                        }
+                    }
+                    if (masked) { S_regs[idx] = -INFINITY; }
+                }
+            }
+        }
+    };
+
 };
 
 } // namespace flash

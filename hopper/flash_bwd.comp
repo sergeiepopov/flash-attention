@@ -1,0 +1,715 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// ============================================================================
+// FlashAttention-2 Backward Pass — Vulkan GLSL Compute Shader
+//
+// Translated from the non-FLASH_USE_CUTLASS_TENSOR (raw register) path in
+// mainloop_bwd_sm80.hpp.  Variable names mirror the CUDA source.
+//
+// Algorithm (per K/V block):
+//   1. Load K, V to shared memory; initialize tdKrdK=0, tdVrdV=0 accumulators
+//   2. For each Q block (m_block):
+//      a. Load Q, dO, LSE_log2, dPsum to shared memory
+//      b. S_regs  = Q × K^T                         (scores, fp32)
+//      c. S_regs  = exp2(S_regs * scale_log2 - LSE) (softmax → P in-place)
+//      d. dP_regs = dO × V^T                        (fp32)
+//      e. dP_regs = P * (dP_regs - dPsum)           (→ dS in-place)
+//      f. Convert P→f16 (P_raw), write to smem; tdVrdV += P^T × dO
+//      g. Convert dS→f16 (dS_raw), write to smem; tdKrdK += dS^T × Q
+//      h. dQ_regs = dS × K  (atomicAdd to global fp32 buffer)
+//   3. Scale tdKrdK by softmax_scale; write dK, dV to global memory (f16)
+//
+// Dispatch: (ceil(seqlen_k / kBlockN), num_heads_k, batch_size)
+// Workgroup: NumMmaThreads invocations
+//
+// Limitations of this version:
+//   - No softcap
+//   - Non-varlen (fixed sequence lengths per batch)
+//   - Non-GQA (num_heads == num_heads_k)
+//   - Assumes dQ_accum buffer is pre-zeroed; a postprocessing pass must
+//     scale dQ by softmax_scale and convert to f16
+//   - Requires maxComputeSharedMemorySize >= ~33 KB for default tile sizes
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Tile / block configuration — change these before compilation as needed.
+// kBlockM * kBlockN must equal NumMmaThreads * TILE_MN * TILE_MN.
+// kBlockN * kHeadDim must equal NumMmaThreads * TILE_ROWS * TILE_COLS_D.
+// ---------------------------------------------------------------------------
+// Set to 1 to enable causal (autoregressive) masking, 0 for bidirectional.
+#define IS_CAUSAL    1
+// Set to 1 to enable local (sliding window) attention.
+#define IS_LOCAL     0
+// Separate masking iterations: skip masking checks for m_blocks that are
+// fully within the valid region.  Mirrors SeparateMaskingIterations in CUDA.
+#define SeparateMaskingIterations 1
+
+#define kBlockM      64
+#define kBlockN      64
+#define kHeadDim     64
+#define NumMmaThreads 256
+
+#define NEG_INF uintBitsToFloat(0xFF800000u)  // IEEE 754 -infinity
+
+// ---------------------------------------------------------------------------
+// Global→shared memory copy layout — mirrors the CUDA triple-loop structure.
+//
+// Threads are distributed in a 2D grid over the (rows × cols) tile.
+// Each thread loads kGmemElemsPerLoad consecutive f16 elements (vectorized)
+// per inner iteration, covering one cache-line-width chunk at a time.
+// ---------------------------------------------------------------------------
+#define kBytePerRow        (kHeadDim * 2)
+#define kBlockKGmem        (kBytePerRow % 128 == 0 ? 64  \
+                          : kBytePerRow %  64 == 0 ? 32  \
+                          :                           16)
+#define kGmemElemsPerLoad  8                                 // 128-bit / 16-bit
+#define kGmemThreadsPerRow (kBlockKGmem / kGmemElemsPerLoad)
+#define kThreadRows        (NumMmaThreads / kGmemThreadsPerRow)
+
+// Do we need bound check to make sure the row doesn't go above kBlockN / kBlockM
+#define EvenN              (kBlockN % kThreadRows == 0)
+#define EvenM              (kBlockM % kThreadRows == 0)
+
+// Per-thread tile sizes (4×4 for 64×64 with 256 threads)
+#define TILE_MN     4                                        // rows & cols per thread for M×N
+#define TPR_MN      (kBlockN / TILE_MN)                      // threads per row, M×N (= 16)
+#define TILE_ROWS   4                                        // rows per thread for N×D / M×D
+#define TILE_COLS_D (kHeadDim * kBlockN / (NumMmaThreads * TILE_ROWS))
+#define TPR_D       (kHeadDim / TILE_COLS_D)                 // threads per row, N×D / M×D
+
+layout(local_size_x = NumMmaThreads) in;
+
+// ---------------------------------------------------------------------------
+// Parameters (uniform buffer)
+// ---------------------------------------------------------------------------
+layout(set = 0, binding = 9) uniform Params {
+    uint  seqlen_q;
+    uint  seqlen_k;
+    uint  num_heads;
+    uint  num_heads_k;
+    float softmax_scale;
+    float softmax_scale_log2;   // softmax_scale * log2(e)
+
+    uint q_row_stride;   uint q_head_stride;   uint q_batch_stride;
+    uint k_row_stride;   uint k_head_stride;   uint k_batch_stride;
+    uint v_row_stride;   uint v_head_stride;   uint v_batch_stride;
+    uint do_row_stride;  uint do_head_stride;  uint do_batch_stride;
+    uint dk_row_stride;  uint dk_head_stride;  uint dk_batch_stride;
+    uint dv_row_stride;  uint dv_head_stride;  uint dv_batch_stride;
+
+    uint lse_head_stride;    uint lse_batch_stride;
+    uint dpsum_head_stride;  uint dpsum_batch_stride;
+    uint dq_head_stride;     uint dq_batch_stride;
+    int  window_size_left;   int  window_size_right;
+} params;
+
+// ---------------------------------------------------------------------------
+// Buffer bindings
+// ---------------------------------------------------------------------------
+layout(set = 0, binding = 0) readonly  buffer BufQ     { float16_t d[]; } buf_Q;
+layout(set = 0, binding = 1) readonly  buffer BufK     { float16_t d[]; } buf_K;
+layout(set = 0, binding = 2) readonly  buffer BufV     { float16_t d[]; } buf_V;
+layout(set = 0, binding = 3) readonly  buffer BufDO    { float16_t d[]; } buf_dO;
+layout(set = 0, binding = 4) readonly  buffer BufLSE   { float     d[]; } buf_LSE;
+layout(set = 0, binding = 5) readonly  buffer BufDPsum { float     d[]; } buf_dPsum;
+layout(set = 0, binding = 6)           buffer BufDQ    { uint      d[]; } buf_dQ;   // fp32 via CAS
+layout(set = 0, binding = 7) writeonly buffer BufDK    { float16_t d[]; } buf_dK;
+layout(set = 0, binding = 8) writeonly buffer BufDV    { float16_t d[]; } buf_dV;
+
+// ---------------------------------------------------------------------------
+// Shared memory (with buffer reuse to reduce peak footprint)
+//
+//   smem_k     : persistent K tile  (kBlockN × kHeadDim, f16)
+//   smem_q     : Q tile per m_block (kBlockM × kHeadDim, f16)
+//   smem_v     : V tile      (kBlockN × kHeadDim, f16)
+//   smem_p     : P tile      (kBlockM × kBlockN,  f16)
+//   smem_do    : dO tile     (kBlockM × kHeadDim, f16)
+//   smem_ds    : dS tile     (kBlockM × kBlockN,  f16)
+//   smem_lse   : LSE_log2    (kBlockM, f32)
+//   smem_dpsum : dPsum       (kBlockM, f32)
+// ---------------------------------------------------------------------------
+shared float16_t smem_k     [kBlockN * kHeadDim];
+shared float16_t smem_q     [kBlockM * kHeadDim];
+shared float16_t smem_v     [kBlockN * kHeadDim];
+shared float16_t smem_p     [kBlockM * kBlockN];
+shared float16_t smem_do    [kBlockM * kHeadDim];
+shared float16_t smem_ds    [kBlockM * kBlockN];
+shared float     smem_lse   [kBlockM];
+shared float     smem_dpsum [kBlockM];
+
+// ---------------------------------------------------------------------------
+// Portable float atomicAdd via compare-and-swap (works without
+// GL_EXT_shader_atomic_float).  buf_dQ is declared as uint[] so we can use
+// atomicCompSwap and reinterpret bits.
+// ---------------------------------------------------------------------------
+void atomicAddF32(uint index, float val) {
+    if (val == 0.0) return;
+    uint old_bits = buf_dQ.d[index];
+    for (;;) {
+        uint new_bits = floatBitsToUint(uintBitsToFloat(old_bits) + val);
+        uint result   = atomicCompSwap(buf_dQ.d[index], old_bits, new_bits);
+        if (result == old_bits) break;
+        old_bits = result;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mask mode constants — select which masking is applied per bwd_step call.
+//   MASK_SEQLENK_ONLY : only seqlen-k out-of-bounds masking
+//   MASK_CAUSAL_LOCAL  : causal + local masking (+ seqlen-k)
+//   MASK_LOCAL_ONLY    : local masking only, no causal (+ seqlen-k)
+// ---------------------------------------------------------------------------
+#define MASK_SEQLENK_ONLY  0
+#define MASK_CAUSAL_LOCAL  1
+#define MASK_LOCAL_ONLY    2
+
+// ============================================================================
+// bwd_step — one iteration of the backward pass inner loop.
+// Mirrors the bwd_step lambda in mainloop_bwd_sm80.hpp.
+// ============================================================================
+void bwd_step(
+    uint m_block, uint n_block, uint bidh, uint bidb, uint thread_idx,
+    int mask_mode,
+    inout float dK_acc[TILE_ROWS][TILE_COLS_D],
+    inout float dV_acc[TILE_ROWS][TILE_COLS_D]
+) {
+    uint tm   = (thread_idx / TPR_MN) * TILE_MN;
+    uint tn   = (thread_idx % TPR_MN) * TILE_MN;
+    uint tn_d = (thread_idx / TPR_D)  * TILE_ROWS;
+    uint td   = (thread_idx % TPR_D)  * TILE_COLS_D;
+    uint tm_d = (thread_idx / TPR_D)  * TILE_ROWS;
+    uint td_q = (thread_idx % TPR_D)  * TILE_COLS_D;
+
+    // -- load_Q_LSE --------------------------------------------------------
+    {
+        const uint num_m_elements = kBlockM / kThreadRows;
+        const uint num_k_elements = kHeadDim / kBlockKGmem;
+        const uint num_vec_copies = kGmemElemsPerLoad;
+
+        uint thread_row = thread_idx / kGmemThreadsPerRow;
+        uint thread_col = thread_idx % kGmemThreadsPerRow;
+
+        uint q_row_stride = params.q_row_stride;
+        uint gmem_Q_ptr = bidb * params.q_batch_stride
+                        + bidh * params.q_head_stride
+                        + m_block * kBlockM * q_row_stride;
+        uint thread_base_gmem = thread_row * q_row_stride
+                              + thread_col * kGmemElemsPerLoad;
+
+        bool tQpQ_raw[num_k_elements];
+        for (uint kk = 0; kk < num_k_elements; ++kk)
+            tQpQ_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < kHeadDim;
+
+        int remaining_seqlen = int(params.seqlen_q) - int(m_block * kBlockM);
+
+        for (uint m = 0; m < num_m_elements; ++m) {
+            bool row_within_tile;
+#if EvenM
+            row_within_tile = true;
+#else
+            row_within_tile = (m < num_m_elements - 1) || (thread_row + m * kThreadRows < kBlockM);
+#endif
+            if (row_within_tile) {
+                uint actual_row = thread_row + m * kThreadRows;
+                bool predicate_m = int(actual_row) < remaining_seqlen;
+
+                for (uint kk = 0; kk < num_k_elements; ++kk) {
+                    bool predicate_both = tQpQ_raw[kk] && predicate_m;
+
+                    for (uint vec = 0; vec < num_vec_copies; ++vec) {
+                        uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                        uint smem_idx = actual_row * kHeadDim + col;
+
+                        if (predicate_both) {
+                            uint gmem_idx = thread_base_gmem + vec + m * kThreadRows * q_row_stride + kk * kBlockKGmem;
+                            smem_q[smem_idx] = buf_Q.d[gmem_Q_ptr + gmem_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    {
+        uint lse_base = thread_idx * 4;
+        uint gmem_LSE_ptr = bidb * params.lse_batch_stride
+                          + bidh * params.lse_head_stride
+                          + m_block * kBlockM;
+        if (lse_base < kBlockM) {
+            for (uint v = 0; v < 4; ++v)
+                smem_lse[lse_base + v] = buf_LSE.d[gmem_LSE_ptr + lse_base + v];
+        }
+    }
+
+    // -- load_dO_dPsum -----------------------------------------------------
+    {
+        const uint num_m_elements = kBlockM / kThreadRows;
+        const uint num_k_elements = kHeadDim / kBlockKGmem;
+        const uint num_vec_copies = kGmemElemsPerLoad;
+
+        uint thread_row = thread_idx / kGmemThreadsPerRow;
+        uint thread_col = thread_idx % kGmemThreadsPerRow;
+
+        uint do_row_stride = params.do_row_stride;
+        uint gmem_dO_ptr = bidb * params.do_batch_stride
+                         + bidh * params.do_head_stride
+                         + m_block * kBlockM * do_row_stride;
+        uint thread_base_gmem = thread_row * do_row_stride
+                              + thread_col * kGmemElemsPerLoad;
+
+        bool tdOpdO_raw[num_k_elements];
+        for (uint kk = 0; kk < num_k_elements; ++kk)
+            tdOpdO_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < kHeadDim;
+
+        int remaining_seqlen = int(params.seqlen_q) - int(m_block * kBlockM);
+
+        for (uint m = 0; m < num_m_elements; ++m) {
+            bool row_within_tile;
+#if EvenM
+            row_within_tile = true;
+#else
+            row_within_tile = (m < num_m_elements - 1) || (thread_row + m * kThreadRows < kBlockM);
+#endif
+            if (row_within_tile) {
+                uint actual_row = thread_row + m * kThreadRows;
+                bool predicate_m = int(actual_row) < remaining_seqlen;
+
+                for (uint kk = 0; kk < num_k_elements; ++kk) {
+                    bool predicate_both = tdOpdO_raw[kk] && predicate_m;
+
+                    for (uint vec = 0; vec < num_vec_copies; ++vec) {
+                        uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                        uint smem_idx = actual_row * kHeadDim + col;
+
+                        if (predicate_both) {
+                            uint gmem_idx = thread_base_gmem + vec + m * kThreadRows * do_row_stride + kk * kBlockKGmem;
+                            smem_do[smem_idx] = buf_dO.d[gmem_dO_ptr + gmem_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    {
+        uint lse_base = thread_idx * 4;
+        uint gmem_dPsum_ptr = bidb * params.dpsum_batch_stride
+                            + bidh * params.dpsum_head_stride
+                            + m_block * kBlockM;
+        if (lse_base < kBlockM) {
+            for (uint v = 0; v < 4; ++v)
+                smem_dpsum[lse_base + v] = buf_dPsum.d[gmem_dPsum_ptr + lse_base + v];
+        }
+    }
+
+    barrier();
+
+    // -- S = Q × K^T -------------------------------------------------------
+    float S_regs[TILE_MN][TILE_MN];
+    for (uint i = 0; i < TILE_MN; ++i)
+        for (uint j = 0; j < TILE_MN; ++j)
+            S_regs[i][j] = 0.0;
+
+    for (uint k = 0; k < kHeadDim; ++k) {
+        float qv[TILE_MN];
+        for (uint i = 0; i < TILE_MN; ++i)
+            qv[i] = float(smem_q[(tm + i) * kHeadDim + k]);
+        for (uint j = 0; j < TILE_MN; ++j) {
+            float kv = float(smem_k[(tn + j) * kHeadDim + k]);
+            for (uint i = 0; i < TILE_MN; ++i)
+                S_regs[i][j] += qv[i] * kv;
+        }
+    }
+
+    // -- Masking (parameterized by mask_mode) -------------------------------
+    // Mirrors mask.apply<Seqlenk_mask, Causal_mask, Local_mask>() in mask.h.
+    {
+        int causal_offset = int(params.seqlen_k) - int(params.seqlen_q);
+
+        for (uint i = 0; i < TILE_MN; ++i) {
+            int q_pos = int(m_block * kBlockM + tm + i);
+            for (uint j = 0; j < TILE_MN; ++j) {
+                int k_pos = int(n_block * kBlockN + tn + j);
+                bool masked = false;
+
+                if (mask_mode == MASK_SEQLENK_ONLY) {
+                    masked = k_pos >= int(params.seqlen_k);
+                }
+#if IS_CAUSAL
+                else if (mask_mode == MASK_CAUSAL_LOCAL) {
+                    int col_limit = min(q_pos + causal_offset + 1, int(params.seqlen_k));
+                    masked = k_pos >= col_limit;
+                }
+#endif
+#if IS_LOCAL
+                else if (mask_mode == MASK_CAUSAL_LOCAL) {
+                    int col_limit_right = min(q_pos + causal_offset + params.window_size_right + 1, int(params.seqlen_k));
+                    int col_limit_left  = q_pos + causal_offset - params.window_size_left;
+                    masked = (k_pos >= col_limit_right) || (k_pos < col_limit_left);
+                }
+                else if (mask_mode == MASK_LOCAL_ONLY) {
+                    int col_limit_right = min(q_pos + causal_offset + params.window_size_right + 1, int(params.seqlen_k));
+                    int col_limit_left  = q_pos + causal_offset - params.window_size_left;
+                    masked = (k_pos >= col_limit_right) || (k_pos < col_limit_left);
+                }
+#endif
+
+                if (masked) S_regs[i][j] = NEG_INF;
+            }
+        }
+    }
+
+    // -- Softmax: P = exp2(S · scale_log2 − LSE) ---------------------------
+    float P[TILE_MN][TILE_MN];
+    for (uint i = 0; i < TILE_MN; ++i) {
+        float lse_val = smem_lse[tm + i];
+        for (uint j = 0; j < TILE_MN; ++j)
+            P[i][j] = exp2(S_regs[i][j] * params.softmax_scale_log2 - lse_val);
+    }
+
+    // -- dP = dO × V^T -----------------------------------------------------
+    float dP_regs[TILE_MN][TILE_MN];
+    for (uint i = 0; i < TILE_MN; ++i)
+        for (uint j = 0; j < TILE_MN; ++j)
+            dP_regs[i][j] = 0.0;
+
+    for (uint k = 0; k < kHeadDim; ++k) {
+        float dov[TILE_MN];
+        for (uint i = 0; i < TILE_MN; ++i)
+            dov[i] = float(smem_do[(tm + i) * kHeadDim + k]);
+        for (uint j = 0; j < TILE_MN; ++j) {
+            float vv = float(smem_v[(tn + j) * kHeadDim + k]);
+            for (uint i = 0; i < TILE_MN; ++i)
+                dP_regs[i][j] += dov[i] * vv;
+        }
+    }
+
+    // -- dS = P · (dP − dPsum) in-place in dP_regs -------------------------
+    for (uint i = 0; i < TILE_MN; ++i) {
+        float dpsum_val = smem_dpsum[tm + i];
+        for (uint j = 0; j < TILE_MN; ++j)
+            dP_regs[i][j] = P[i][j] * (dP_regs[i][j] - dpsum_val);
+    }
+
+    // -- Write P_raw → smem_p -----------------------------------------------
+    barrier();
+    for (uint i = 0; i < TILE_MN; ++i)
+        for (uint j = 0; j < TILE_MN; ++j)
+            smem_p[(tm + i) * kBlockN + (tn + j)] = float16_t(P[i][j]);
+    barrier();
+
+    // -- dV += P^T × dO -----------------------------------------------------
+    for (uint m = 0; m < kBlockM; ++m) {
+        float pv[TILE_ROWS];
+        for (uint i = 0; i < TILE_ROWS; ++i)
+            pv[i] = float(smem_p[m * kBlockN + (tn_d + i)]);
+        for (uint j = 0; j < TILE_COLS_D; ++j) {
+            float dov = float(smem_do[m * kHeadDim + (td + j)]);
+            for (uint i = 0; i < TILE_ROWS; ++i)
+                dV_acc[i][j] += pv[i] * dov;
+        }
+    }
+
+    // -- Write dS_raw → smem_ds ---------------------------------------------
+    barrier();
+    for (uint i = 0; i < TILE_MN; ++i)
+        for (uint j = 0; j < TILE_MN; ++j)
+            smem_ds[(tm + i) * kBlockN + (tn + j)] = float16_t(dP_regs[i][j]);
+    barrier();
+
+    // -- dK += dS^T × Q -----------------------------------------------------
+    for (uint m = 0; m < kBlockM; ++m) {
+        float dsv[TILE_ROWS];
+        for (uint i = 0; i < TILE_ROWS; ++i)
+            dsv[i] = float(smem_ds[m * kBlockN + (tn_d + i)]);
+        for (uint j = 0; j < TILE_COLS_D; ++j) {
+            float qv = float(smem_q[m * kHeadDim + (td + j)]);
+            for (uint i = 0; i < TILE_ROWS; ++i)
+                dK_acc[i][j] += dsv[i] * qv;
+        }
+    }
+
+    // -- dQ += dS × K (atomicAdd) -------------------------------------------
+    float dQ_regs[TILE_ROWS][TILE_COLS_D];
+    for (uint i = 0; i < TILE_ROWS; ++i)
+        for (uint j = 0; j < TILE_COLS_D; ++j)
+            dQ_regs[i][j] = 0.0;
+
+    for (uint n = 0; n < kBlockN; ++n) {
+        float dsv[TILE_ROWS];
+        for (uint i = 0; i < TILE_ROWS; ++i)
+            dsv[i] = float(smem_ds[(tm_d + i) * kBlockN + n]);
+        for (uint j = 0; j < TILE_COLS_D; ++j) {
+            float kv = float(smem_k[n * kHeadDim + (td_q + j)]);
+            for (uint i = 0; i < TILE_ROWS; ++i)
+                dQ_regs[i][j] += dsv[i] * kv;
+        }
+    }
+
+    uint dq_base = bidb * params.dq_batch_stride + bidh * params.dq_head_stride;
+    for (uint i = 0; i < TILE_ROWS; ++i) {
+        uint gRow = m_block * kBlockM + tm_d + i;
+        if (gRow < params.seqlen_q) {
+            for (uint j = 0; j < TILE_COLS_D; ++j) {
+                uint gCol = td_q + j;
+                if (gCol < kHeadDim)
+                    atomicAddF32(dq_base + gRow * kHeadDim + gCol,
+                                 dQ_regs[i][j]);
+            }
+        }
+    }
+
+    barrier();
+}
+
+// ============================================================================
+void main() {
+    uint n_block    = gl_WorkGroupID.x;
+    uint bidh       = gl_WorkGroupID.y;
+    uint bidb       = gl_WorkGroupID.z;
+    uint thread_idx = gl_LocalInvocationIndex;
+
+    // -- Thread-tile coordinates for M×N outputs (S, dP, P, dS) -------------
+    uint tm  = (thread_idx / TPR_MN) * TILE_MN;
+    uint tn  = (thread_idx % TPR_MN) * TILE_MN;
+
+    // -- Thread-tile coordinates for N×D outputs (dK, dV) --------------------
+    uint tn_d = (thread_idx / TPR_D) * TILE_ROWS;
+    uint td   = (thread_idx % TPR_D) * TILE_COLS_D;
+
+    // -- Thread-tile coordinates for M×D output (dQ) -------------------------
+    uint tm_d = (thread_idx / TPR_D) * TILE_ROWS;
+    uint td_q = (thread_idx % TPR_D) * TILE_COLS_D;
+
+    // ========================================================================
+    // Load V tile → smem_v   (kBlockN × kHeadDim, row-major)
+    // ========================================================================
+    {
+        const uint num_n_elements = kBlockN / kThreadRows;
+        const uint num_k_elements = kHeadDim / kBlockKGmem;
+        const uint num_vec_copies = kGmemElemsPerLoad;
+
+        uint thread_row = thread_idx / kGmemThreadsPerRow;
+        uint thread_col = thread_idx % kGmemThreadsPerRow;
+
+        uint v_row_stride = params.v_row_stride;
+        uint gmem_V_ptr = bidb * params.v_batch_stride
+                        + bidh * params.v_head_stride
+                        + n_block * kBlockN * v_row_stride;
+        uint thread_base_gmem = thread_row * v_row_stride
+                              + thread_col * kGmemElemsPerLoad;
+
+        bool tVpV_raw[num_k_elements];
+        for (uint kk = 0; kk < num_k_elements; ++kk)
+            tVpV_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < kHeadDim;
+
+        int remaining_seqlen = int(params.seqlen_k) - int(n_block * kBlockN);
+
+        for (uint m = 0; m < num_n_elements; ++m) {
+            bool row_within_tile;
+#if EvenN
+            row_within_tile = true;
+#else
+            row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
+#endif
+            if (row_within_tile) {
+                uint actual_row = thread_row + m * kThreadRows;
+                bool predicate_n = int(actual_row) < remaining_seqlen;
+
+                for (uint kk = 0; kk < num_k_elements; ++kk) {
+                    bool predicate_both = tVpV_raw[kk] && predicate_n;
+
+                    for (uint vec = 0; vec < num_vec_copies; ++vec) {
+                        uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                        uint smem_idx = actual_row * kHeadDim + col;
+
+                        if (predicate_both) {
+                            uint gmem_idx = thread_base_gmem + vec + m * kThreadRows * v_row_stride + kk * kBlockKGmem;
+                            smem_v[smem_idx] = buf_V.d[gmem_V_ptr + gmem_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ========================================================================
+    // Load K tile → smem_k   (kBlockN × kHeadDim, row-major)
+    // ========================================================================
+    {
+        const uint num_n_elements = kBlockN / kThreadRows;
+        const uint num_k_elements = kHeadDim / kBlockKGmem;
+        const uint num_vec_copies = kGmemElemsPerLoad;
+
+        uint thread_row = thread_idx / kGmemThreadsPerRow;
+        uint thread_col = thread_idx % kGmemThreadsPerRow;
+
+        uint k_row_stride = params.k_row_stride;
+        uint gmem_K_ptr = bidb * params.k_batch_stride
+                        + bidh * params.k_head_stride
+                        + n_block * kBlockN * k_row_stride;
+        uint thread_base_gmem = thread_row * k_row_stride
+                              + thread_col * kGmemElemsPerLoad;
+
+        bool tKpK_raw[num_k_elements];
+        for (uint kk = 0; kk < num_k_elements; ++kk)
+            tKpK_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < kHeadDim;
+
+        int remaining_seqlen = int(params.seqlen_k) - int(n_block * kBlockN);
+
+        for (uint m = 0; m < num_n_elements; ++m) {
+            bool row_within_tile;
+#if EvenN
+            row_within_tile = true;
+#else
+            row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
+#endif
+            if (row_within_tile) {
+                uint actual_row = thread_row + m * kThreadRows;
+                bool predicate_n = int(actual_row) < remaining_seqlen;
+
+                for (uint kk = 0; kk < num_k_elements; ++kk) {
+                    bool predicate_both = tKpK_raw[kk] && predicate_n;
+
+                    for (uint vec = 0; vec < num_vec_copies; ++vec) {
+                        uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                        uint smem_idx = actual_row * kHeadDim + col;
+
+                        if (predicate_both) {
+                            uint gmem_idx = thread_base_gmem + vec + m * kThreadRows * k_row_stride + kk * kBlockKGmem;
+                            smem_k[smem_idx] = buf_K.d[gmem_K_ptr + gmem_idx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+
+    // ========================================================================
+    // Persistent accumulators for dK and dV  (N × D, fp32)
+    // Corresponds to tdKrdK / tdVrdV in CUDA; accessed as dK_acc / dV_acc
+    // in the raw path.
+    // ========================================================================
+    float dK_acc[TILE_ROWS][TILE_COLS_D];
+    float dV_acc[TILE_ROWS][TILE_COLS_D];
+    for (uint i = 0; i < TILE_ROWS; ++i)
+        for (uint j = 0; j < TILE_COLS_D; ++j) {
+            dK_acc[i][j] = 0.0;
+            dV_acc[i][j] = 0.0;
+        }
+
+    // ========================================================================
+    // Compute m_block iteration range — mirrors get_m_block_min_max() in
+    // block.h.
+    // ========================================================================
+    int seqlen_q = int(params.seqlen_q);
+    int seqlen_k = int(params.seqlen_k);
+    int m_block_max = (seqlen_q + kBlockM - 1) / kBlockM;
+    int m_block_min = 0;
+
+#if IS_LOCAL
+    m_block_max = min(m_block_max,
+        (int(n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left + kBlockM - 1) / kBlockM);
+#endif
+#if IS_CAUSAL || IS_LOCAL
+    m_block_min = max(m_block_min,
+        (int(n_block) * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
+#endif
+
+    // It's possible to have m_block_max <= m_block_min.  Exit early.
+#if IS_CAUSAL || IS_LOCAL
+    if (m_block_max <= m_block_min) {
+        uint dk_base = bidb * params.dk_batch_stride + bidh * params.dk_head_stride;
+        uint dv_base = bidb * params.dv_batch_stride + bidh * params.dv_head_stride;
+        for (uint i = 0; i < TILE_ROWS; ++i) {
+            uint gRow = n_block * kBlockN + tn_d + i;
+            if (gRow < params.seqlen_k) {
+                for (uint j = 0; j < TILE_COLS_D; ++j) {
+                    uint gCol = td + j;
+                    if (gCol < kHeadDim) {
+                        buf_dK.d[dk_base + gRow * params.dk_row_stride + gCol] = float16_t(0.0);
+                        buf_dV.d[dv_base + gRow * params.dv_row_stride + gCol] = float16_t(0.0);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+    // ========================================================================
+    // Loop boundaries for SeparateMaskingIterations — mirrors the 3-loop
+    // structure in mainloop_bwd_sm80.hpp.
+    //
+    //   Loop 1: [m_block_min, m_block_masking_max)   — causal+local masking
+    //   Loop 2: [m_block_masking_max, m_block_max_before_local_mask) — seqlen-k mask only
+    //   Loop 3: [m_block_max_before_local_mask, m_block_max)  — local masking only
+    //
+    // When SeparateMaskingIterations == 0, loops 1 & 3 are empty and loop 2
+    // applies all masking.
+    // ========================================================================
+    int m_block_masking_max = min(m_block_max,
+        ((int(n_block) + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1);
+
+#if IS_LOCAL
+    int m_block_max_before_local_mask = min(m_block_max,
+        (int(n_block) * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
+#else
+    int m_block_max_before_local_mask = m_block_max;
+#endif
+
+    int m_block = m_block_min;
+
+    // ========================================================================
+    // Three-loop structure mirroring mainloop_bwd_sm80.hpp.
+    //
+    // The m_block range is split so that the expensive causal/local masking
+    // checks are only applied to iterations near the mask boundaries.
+    // The middle loop runs with seqlen-k masking only (cheapest).
+    // ========================================================================
+
+    // Loop 1: causal + local masking (near the diagonal)
+#if IS_CAUSAL || IS_LOCAL
+    for (; m_block < m_block_masking_max; ++m_block) {
+        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
+                 MASK_CAUSAL_LOCAL, dK_acc, dV_acc);
+    }
+#endif
+
+    // Loop 2: middle region — seqlen-k mask only
+    for (; m_block < m_block_max_before_local_mask; ++m_block) {
+        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
+                 MASK_SEQLENK_ONLY, dK_acc, dV_acc);
+    }
+
+    // Loop 3: local masking only (far side of the local window)
+#if IS_LOCAL
+    for (; m_block < m_block_max; ++m_block) {
+        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
+                 MASK_LOCAL_ONLY, dK_acc, dV_acc);
+    }
+#endif
+
+    // ========================================================================
+    // Epilogue: scale tdKrdK by softmax_scale, write dK and dV to global (f16)
+    // ========================================================================
+    uint dk_base = bidb * params.dk_batch_stride + bidh * params.dk_head_stride;
+    uint dv_base = bidb * params.dv_batch_stride + bidh * params.dv_head_stride;
+
+    for (uint i = 0; i < TILE_ROWS; ++i) {
+        uint gRow = n_block * kBlockN + tn_d + i;
+        if (gRow < params.seqlen_k) {
+            for (uint j = 0; j < TILE_COLS_D; ++j) {
+                uint gCol = td + j;
+                if (gCol < kHeadDim) {
+                    buf_dK.d[dk_base + gRow * params.dk_row_stride + gCol] =
+                        float16_t(dK_acc[i][j] * params.softmax_scale);
+                    buf_dV.d[dv_base + gRow * params.dv_row_stride + gCol] =
+                        float16_t(dV_acc[i][j]);
+                }
+            }
+        }
+    }
+}
