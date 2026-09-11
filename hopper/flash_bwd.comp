@@ -870,249 +870,164 @@ void atomicAddF16(uint f16_idx, float val)
 }
 
 // ============================================================================
-// bwd_step — one iteration of the backward pass inner loop.
+// Per-element callbacks for cooperative matrix backward pass operations.
+// These access the params uniform and shared memory directly.
 // ============================================================================
-void bwd_step(uint m_block, uint n_block, uint bidh, uint bidb, uint thread_idx, int mask_mode, int m_block_max, inout float dK_acc[TILE_ROWS][TILE_COLS_D], inout float dV_acc[TILE_ROWS][TILE_COLS_D])
+
+float bwd_apply_mask(const in uint32_t r, const in uint32_t c, const in float elem,
+                     const in int mask_mode_val, const in uint32_t m_offset,
+                     const in uint32_t n_offset)
 {
-    uint tm   = (thread_idx / TPR_MN) * TILE_MN;
-    uint tn   = (thread_idx % TPR_MN) * TILE_MN;
-    uint tn_d = (thread_idx / TPR_D)  * TILE_ROWS;
-    uint td   = (thread_idx % TPR_D)  * TILE_COLS_D;
-    uint tm_d = (thread_idx / TPR_D)  * TILE_ROWS;
-    uint td_q = (thread_idx % TPR_D)  * TILE_COLS_D;
+    int k_pos = int(n_offset + c);
 
-    // -- S = Q × K^T -------------------------------------------------------
-    float S_regs[TILE_MN][TILE_MN];
-    for (uint i = 0; i < TILE_MN; ++i)
+    if (mask_mode_val == MASK_SEQLENK_ONLY)
     {
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            S_regs[i][j] = 0.0;
-        }
+        return (k_pos >= int(params.seqlen_k)) ? NEG_INF : elem;
     }
 
-    for (uint k = 0; k < kHeadDim; ++k)
+    int q_pos = int(m_offset + r);
+    int causal_offset = int(params.seqlen_k) - int(params.seqlen_q);
+
+#if IS_CAUSAL && !IS_LOCAL
+    if (mask_mode_val == MASK_CAUSAL_LOCAL)
     {
-        float qv[TILE_MN];
-        for (uint i = 0; i < TILE_MN; ++i)
-        {
-            qv[i] = float(smem_q[(tm + i) * kHeadDim + k]);
-        }
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            float kv = float(smem_k[(tn + j) * kHeadDim + k]);
-            for (uint i = 0; i < TILE_MN; ++i)
-            {
-                S_regs[i][j] += qv[i] * kv;
-            }
-        }
+        int col_limit = min(q_pos + causal_offset + 1, int(params.seqlen_k));
+        return (k_pos >= col_limit) ? NEG_INF : elem;
     }
-
-    // -- Masking (parameterized by mask_mode) -------------------------------
-    {
-        int causal_offset = int(params.seqlen_k) - int(params.seqlen_q);
-
-        for (uint i = 0; i < TILE_MN; ++i)
-        {
-            int q_pos = int(m_block * kBlockM + tm + i);
-            for (uint j = 0; j < TILE_MN; ++j)
-            {
-                int k_pos = int(n_block * kBlockN + tn + j);
-                bool masked = false;
-
-                if (mask_mode == MASK_SEQLENK_ONLY)
-                {
-                    masked = k_pos >= int(params.seqlen_k);
-                }
-#if IS_CAUSAL
-                else if (mask_mode == MASK_CAUSAL_LOCAL)
-                {
-                    int col_limit = min(q_pos + causal_offset + 1, int(params.seqlen_k));
-                    masked = k_pos >= col_limit;
-                }
 #endif
 #if IS_LOCAL
-                else if (mask_mode == MASK_CAUSAL_LOCAL)
-                {
-                    int col_limit_right = min(q_pos + causal_offset + params.window_size_right + 1, int(params.seqlen_k));
-                    int col_limit_left  = q_pos + causal_offset - params.window_size_left;
-                    masked = (k_pos >= col_limit_right) || (k_pos < col_limit_left);
-                }
-                else if (mask_mode == MASK_LOCAL_ONLY)
-                {
-                    int col_limit_right = min(q_pos + causal_offset + params.window_size_right + 1, int(params.seqlen_k));
-                    int col_limit_left  = q_pos + causal_offset - params.window_size_left;
-                    masked = (k_pos >= col_limit_right) || (k_pos < col_limit_left);
-                }
+    if (mask_mode_val == MASK_CAUSAL_LOCAL || mask_mode_val == MASK_LOCAL_ONLY)
+    {
+        int col_limit_right = min(q_pos + causal_offset + params.window_size_right + 1,
+                                  int(params.seqlen_k));
+        int col_limit_left  = q_pos + causal_offset - params.window_size_left;
+        return (k_pos >= col_limit_right || k_pos < col_limit_left) ? NEG_INF : elem;
+    }
 #endif
+    return elem;
+}
 
-                if (masked)
-                {
-                    S_regs[i][j] = NEG_INF;
-                }
-            }
-        }
-    }
+float bwd_apply_softmax(const in uint32_t r, const in uint32_t c, const in float elem)
+{
+    return exp2(elem * params.softmax_scale_log2 - smem_lse[r]);
+}
 
-    
-    // -- Softmax: P = exp2(S · scale_log2 − LSE) ---------------------------
-    float P[TILE_MN][TILE_MN];
-    for (uint i = 0; i < TILE_MN; ++i)
+float bwd_subtract_dpsum(const in uint32_t r, const in uint32_t c, const in float elem)
+{
+    return elem - smem_dpsum[r];
+}
+
+float bwd_store_dQ(const in uint32_t r, const in uint32_t c, const in float elem,
+                   const in uint32_t dq_base, const in uint32_t m_offset)
+{
+    uint gRow = m_offset + r;
+    if (gRow < params.seqlen_q && c < kHeadDim)
     {
-        float lse_val = smem_lse[tm + i];
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            P[i][j] = exp2(S_regs[i][j] * params.softmax_scale_log2 - lse_val);
-        }
+        atomicAddF16(dq_base + gRow * params.dq_row_stride + c, elem);
     }
+    return elem;
+}
 
-    // -- dP = dO × V^T -----------------------------------------------------
-    float dP_regs[TILE_MN][TILE_MN];
-    for (uint i = 0; i < TILE_MN; ++i)
-    {
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            dP_regs[i][j] = 0.0;
-        }
-    }
+// ============================================================================
+// bwd_step — one iteration of the backward pass inner loop.
+// Uses cooperative matrix (tensor core) operations for all GEMMs.
+// Intermediate P/dS are transposed via shared memory for the dV/dK GEMMs.
+// ============================================================================
+void bwd_step(
+    uint m_block, uint n_block, uint bidh, uint bidb, uint thread_idx,
+    int mask_mode, int m_block_max,
+    inout coopmat<float, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> dK_acc,
+    inout coopmat<float, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> dV_acc)
+{
+    // -- S = Q × K^T  (Br×D) × (D×Bc) → (Br×Bc) ----------------------------
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kHeadDim, gl_MatrixUseA> Q_A;
+    coopMatLoad(Q_A, smem_q, 0, kHeadDim, gl_CooperativeMatrixLayoutRowMajor);
 
-    for (uint k = 0; k < kHeadDim; ++k)
-    {
-        float dov[TILE_MN];
-        for (uint i = 0; i < TILE_MN; ++i)
-        {
-            dov[i] = float(smem_do[(tm + i) * kHeadDim + k]);
-        }
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            float vv = float(smem_v[(tn + j) * kHeadDim + k]);
-            for (uint i = 0; i < TILE_MN; ++i)
-            {
-                dP_regs[i][j] += dov[i] * vv;
-            }
-        }
-    }
+    coopmat<float16_t, gl_ScopeWorkgroup, kHeadDim, kBlockN, gl_MatrixUseB> KT_B;
+    coopMatLoad(KT_B, smem_k, 0, kHeadDim, gl_CooperativeMatrixLayoutColumnMajor);
 
-    // -- dS = P · (dP − dPsum) in-place in dP_regs -------------------------
-    for (uint i = 0; i < TILE_MN; ++i)
-    {
-        float dpsum_val = smem_dpsum[tm + i];
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            dP_regs[i][j] = P[i][j] * (dP_regs[i][j] - dpsum_val);
-        }
-    }
+    coopmat<float, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator> S =
+        coopmat<float, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator>(0.0);
+    S = coopMatMulAdd(Q_A, KT_B, S);
 
-    // -- Write P_raw → smem_p -----------------------------------------------
+    // -- Masking + Softmax → P -----------------------------------------------
+    coopMatPerElementNV(S, S, bwd_apply_mask, mask_mode,
+                        m_block * kBlockM, n_block * kBlockN);
+
+    coopmat<float, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator> P;
+    coopMatPerElementNV(P, S, bwd_apply_softmax);
+
+    // -- dP = dO × V^T  (Br×D) × (D×Bc) → (Br×Bc) --------------------------
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kHeadDim, gl_MatrixUseA> dO_A;
+    coopMatLoad(dO_A, smem_do, 0, kHeadDim, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float16_t, gl_ScopeWorkgroup, kHeadDim, kBlockN, gl_MatrixUseB> VT_B;
+    coopMatLoad(VT_B, smem_v, 0, kHeadDim, gl_CooperativeMatrixLayoutColumnMajor);
+
+    coopmat<float, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator> dP =
+        coopmat<float, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator>(0.0);
+    dP = coopMatMulAdd(dO_A, VT_B, dP);
+
+    // -- dS = P · (dP − dPsum) -----------------------------------------------
+    coopMatPerElementNV(dP, dP, bwd_subtract_dpsum);
+    coopmat<float, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator> dS = P * dP;
+
+    // -- dV += P^T × dO  (Bc×Br) × (Br×D) → (Bc×D) -------------------------
+    // Store P (Br×Bc) to smem row-major, reload as column-major → P^T (Bc×Br)
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator> P_f16 =
+        coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator>(P);
     barrier();
-    for (uint i = 0; i < TILE_MN; ++i)
-    {
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            smem_p[(tm + i) * kBlockN + (tn + j)] = float16_t(P[i][j]);
-        }
-    }
-    barrier();
-
-    // -- dV += P^T × dO -----------------------------------------------------
-    for (uint m = 0; m < kBlockM; ++m)
-    {
-        float pv[TILE_ROWS];
-        for (uint i = 0; i < TILE_ROWS; ++i)
-        {
-            pv[i] = float(smem_p[m * kBlockN + (tn_d + i)]);
-        }
-        for (uint j = 0; j < TILE_COLS_D; ++j)
-        {
-            float dov = float(smem_do[m * kHeadDim + (td + j)]);
-            for (uint i = 0; i < TILE_ROWS; ++i)
-            {
-                dV_acc[i][j] += pv[i] * dov;
-            }
-        }
-    }
-
-    // -- Write dS_raw → smem_p (aliased) -------------------------------------
-    barrier();
-    for (uint i = 0; i < TILE_MN; ++i)
-    {
-        for (uint j = 0; j < TILE_MN; ++j)
-        {
-            smem_p[(tm + i) * kBlockN + (tn + j)] = float16_t(dP_regs[i][j]);
-        }
-    }
+    coopMatStore(P_f16, smem_p, 0, kBlockN, gl_CooperativeMatrixLayoutRowMajor);
     barrier();
 
-    // -- dK += dS^T × Q -----------------------------------------------------
-    for (uint m = 0; m < kBlockM; ++m)
-    {
-        float dsv[TILE_ROWS];
-        for (uint i = 0; i < TILE_ROWS; ++i)
-        {
-            dsv[i] = float(smem_p[m * kBlockN + (tn_d + i)]);
-        }
-        for (uint j = 0; j < TILE_COLS_D; ++j)
-        {
-            float qv = float(smem_q[m * kHeadDim + (td + j)]);
-            for (uint i = 0; i < TILE_ROWS; ++i)
-            {
-                dK_acc[i][j] += dsv[i] * qv;
-            }
-        }
-    }
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kBlockM, gl_MatrixUseA> PT_A;
+    coopMatLoad(PT_A, smem_p, 0, kBlockN, gl_CooperativeMatrixLayoutColumnMajor);
 
-    // -- load_dO_next: smem_do/dpsum are free after dK (mirrors CUDA) -------
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kHeadDim, gl_MatrixUseB> dO_B;
+    coopMatLoad(dO_B, smem_do, 0, kHeadDim, gl_CooperativeMatrixLayoutRowMajor);
+
+    dV_acc = coopMatMulAdd(PT_A, dO_B, dV_acc);
+
+    // -- dK += dS^T × Q  (Bc×Br) × (Br×D) → (Bc×D) -------------------------
+    // Store dS (Br×Bc) to smem row-major, reload as column-major → dS^T (Bc×Br)
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator> dS_f16 =
+        coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseAccumulator>(dS);
+    barrier();
+    coopMatStore(dS_f16, smem_p, 0, kBlockN, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kBlockM, gl_MatrixUseA> dST_A;
+    coopMatLoad(dST_A, smem_p, 0, kBlockN, gl_CooperativeMatrixLayoutColumnMajor);
+
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kHeadDim, gl_MatrixUseB> Q_B;
+    coopMatLoad(Q_B, smem_q, 0, kHeadDim, gl_CooperativeMatrixLayoutRowMajor);
+
+    dK_acc = coopMatMulAdd(dST_A, Q_B, dK_acc);
+
+    // -- Load dO/dPsum for next m_block (smem_do is free after dV) -----------
     if (int(m_block) + 1 < m_block_max)
     {
         load_dO_dPsum(m_block + 1, bidh, bidb, thread_idx);
     }
     barrier();
 
-    // -- dQ += dS × K (atomicAdd) -------------------------------------------
-    float dQ_regs[TILE_ROWS][TILE_COLS_D];
-    for (uint i = 0; i < TILE_ROWS; ++i)
-    {
-        for (uint j = 0; j < TILE_COLS_D; ++j)
-        {
-            dQ_regs[i][j] = 0.0;
-        }
-    }
+    // -- dQ = dS × K  (Br×Bc) × (Bc×D) → (Br×D) then atomicAdd -------------
+    // smem_p still contains dS from the store above
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockM, kBlockN, gl_MatrixUseA> dS_A;
+    coopMatLoad(dS_A, smem_p, 0, kBlockN, gl_CooperativeMatrixLayoutRowMajor);
 
-    for (uint n = 0; n < kBlockN; ++n)
-    {
-        float dsv[TILE_ROWS];
-        for (uint i = 0; i < TILE_ROWS; ++i)
-        {
-            dsv[i] = float(smem_p[(tm_d + i) * kBlockN + n]);
-        }
-        for (uint j = 0; j < TILE_COLS_D; ++j)
-        {
-            float kv = float(smem_k[n * kHeadDim + (td_q + j)]);
-            for (uint i = 0; i < TILE_ROWS; ++i)
-            {
-                dQ_regs[i][j] += dsv[i] * kv;
-            }
-        }
-    }
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseB> K_B;
+    coopMatLoad(K_B, smem_k, 0, kHeadDim, gl_CooperativeMatrixLayoutRowMajor);
 
+    coopmat<float, gl_ScopeWorkgroup, kBlockM, kHeadDim, gl_MatrixUseAccumulator> dQ =
+        coopmat<float, gl_ScopeWorkgroup, kBlockM, kHeadDim, gl_MatrixUseAccumulator>(0.0);
+    dQ = coopMatMulAdd(dS_A, K_B, dQ);
+
+    dQ *= params.softmax_scale;
     uint dq_base = bidb * params.dq_batch_stride + bidh * params.dq_head_stride;
-    for (uint i = 0; i < TILE_ROWS; ++i)
-    {
-        uint gRow = m_block * kBlockM + tm_d + i;
-        if (gRow < params.seqlen_q)
-        {
-            for (uint j = 0; j < TILE_COLS_D; ++j)
-            {
-                uint gCol = td_q + j;
-                if (gCol < kHeadDim)
-                {
-                    atomicAddF16(dq_base + gRow * params.dq_row_stride + gCol, dQ_regs[i][j] * params.softmax_scale);
-                }
-            }
-        }
-    }
+    coopMatPerElementNV(dQ, dQ, bwd_store_dQ, dq_base, m_block * kBlockM);
 
-    // -- load_Q_next: smem_q/lse are free after dQ (mirrors CUDA) -----------
+    // -- Load Q/LSE for next m_block (smem_q is free after dK) ---------------
     if (int(m_block) + 1 < m_block_max)
     {
         load_Q_LSE(m_block + 1, bidh, bidb, thread_idx);
@@ -1126,134 +1041,82 @@ void backward_main()
     const uint bidh       = gl_WorkGroupID.y;
     const uint bidb       = gl_WorkGroupID.z;
     const uint thread_idx = gl_LocalInvocationIndex;
-    
-    // -- Thread-tile coordinates for M×N outputs (S, dP, P, dS) -------------
-    const uint tm  = (thread_idx / TPR_MN) * TILE_MN;
-    const uint tn  = (thread_idx % TPR_MN) * TILE_MN;
-
-    // -- Thread-tile coordinates for N×D outputs (dK, dV) --------------------
-    const uint tn_d = (thread_idx / TPR_D) * TILE_ROWS;
-    const uint td   = (thread_idx % TPR_D) * TILE_COLS_D;
-
-    // -- Thread-tile coordinates for M×D output (dQ) -------------------------
-    const uint tm_d = (thread_idx / TPR_D) * TILE_ROWS;
-    const uint td_q = (thread_idx % TPR_D) * TILE_COLS_D;
-
-    const bool EvenM = kBlockM % kThreadRows == 0;
-    const bool EvenN = kBlockN % kThreadRows == 0;
 
     const uint num_n_elements = kBlockN / kThreadRows;
     const uint num_k_elements = kHeadDim / kBlockKGmem;
     const uint num_vec_copies = kGmemElemsPerLoad;
-    
     const int remaining_seqlen = int(params.seqlen_k) - int(n_block * kBlockN);
-
     const uint thread_row = thread_idx / kGmemThreadsPerRow;
     const uint thread_col = thread_idx % kGmemThreadsPerRow;
 
-    const uint v_row_stride = params.v_row_stride;
-    const uint gmem_V_ptr = bidb * params.v_batch_stride
-                          + bidh * params.v_head_stride
-                          + n_block * kBlockN * v_row_stride;
-
-    const uint thread_base_gmem_v = thread_row * v_row_stride
-                                  + thread_col * kGmemElemsPerLoad;
-                               
-    const uint headdim_V = kHeadDim;
-    bool tVpV_raw[num_k_elements];
-    for (uint kk = 0; kk < num_k_elements; ++kk)
+    // ========================================================================
+    // Load V tile → smem_v  (kBlockN × kHeadDim, row-major)
+    // ========================================================================
     {
-        tVpV_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_V;
-    }
-    
-    [[unroll]]
-    for (int m = 0; m < num_n_elements; ++m)
-    {
-        bool row_within_tile;
-        if (EvenN)
-        {
-            row_within_tile = true;
-        }
-        else
-        {
-            row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
-        }
+        uint v_row_stride = params.v_row_stride;
+        uint gmem_V_ptr = bidb * params.v_batch_stride
+                        + bidh * params.v_head_stride
+                        + n_block * kBlockN * v_row_stride;
+        uint thread_base_gmem = thread_row * v_row_stride
+                              + thread_col * kGmemElemsPerLoad;
 
-        if (row_within_tile)
+        [[unroll]]
+        for (uint m = 0; m < num_n_elements; ++m)
         {
-            const uint actual_row = thread_row + m * kThreadRows;
-            const bool predicate_n = actual_row < remaining_seqlen;
-
-            [[unroll]]
-            for (int kk = 0; kk < num_k_elements; ++kk)
+            uint actual_row = thread_row + m * kThreadRows;
+            if (actual_row < kBlockN)
             {
-                const bool predicate_both = tVpV_raw[kk] && predicate_n;
-                
+                bool predicate_n = int(actual_row) < remaining_seqlen;
                 [[unroll]]
-                for (int vec = 0; vec < num_vec_copies; ++vec)
+                for (uint kk = 0; kk < num_k_elements; ++kk)
                 {
-                    const uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
-                    const uint smem_idx = actual_row * kHeadDim + col;
-
-                    if (predicate_both)
+                    [[unroll]]
+                    for (uint vec = 0; vec < num_vec_copies; ++vec)
                     {
-                        const uint gmem_idx = thread_base_gmem_v + vec + m * kThreadRows * v_row_stride + kk * kBlockKGmem;
-                        smem_v[smem_idx] = buf_V.d[gmem_V_ptr + gmem_idx];
+                        uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                        uint smem_idx = actual_row * kHeadDim + col;
+                        if (predicate_n && col < kHeadDim)
+                        {
+                            uint gmem_idx = thread_base_gmem + vec + m * kThreadRows * v_row_stride + kk * kBlockKGmem;
+                            smem_v[smem_idx] = buf_V.d[gmem_V_ptr + gmem_idx];
+                        }
                     }
                 }
             }
         }
     }
-    
-    const uint k_row_stride = params.k_row_stride;
-    const uint gmem_K_ptr = bidb * params.k_batch_stride
-                          + bidh * params.k_head_stride
-                          + n_block * kBlockN * k_row_stride;
 
-    const uint thread_base_gmem_k = thread_row * k_row_stride
-                                  + thread_col * kGmemElemsPerLoad;
-
-    const uint headdim_K = kHeadDim;
-    bool tKpK_raw[num_k_elements];
-    [[unroll]]
-    for (int kk = 0; kk < num_k_elements; ++kk)
+    // ========================================================================
+    // Load K tile → smem_k  (kBlockN × kHeadDim, row-major)
+    // ========================================================================
     {
-        tKpK_raw[kk] = (thread_col * kGmemElemsPerLoad + kk * kBlockKGmem) < headdim_K;
-    }
-    
-    [[unroll]]
-    for (int m = 0; m < num_n_elements; ++m)
-    {
-        bool row_within_tile;
-        if (EvenN)
-        {
-            row_within_tile = true;
-        }
-        else
-        {
-            row_within_tile = (m < num_n_elements - 1) || (thread_row + m * kThreadRows < kBlockN);
-        }
+        uint k_row_stride = params.k_row_stride;
+        uint gmem_K_ptr = bidb * params.k_batch_stride
+                        + bidh * params.k_head_stride
+                        + n_block * kBlockN * k_row_stride;
+        uint thread_base_gmem = thread_row * k_row_stride
+                              + thread_col * kGmemElemsPerLoad;
 
-        if (row_within_tile)
+        [[unroll]]
+        for (uint m = 0; m < num_n_elements; ++m)
         {
-            const uint actual_row = thread_row + m * kThreadRows;
-            const bool predicate_n = actual_row < remaining_seqlen;
-
-            [[unroll]]
-            for (int kk = 0; kk < num_k_elements; ++kk)
+            uint actual_row = thread_row + m * kThreadRows;
+            if (actual_row < kBlockN)
             {
-                const bool predicate_both = tKpK_raw[kk] && predicate_n;
-
+                bool predicate_n = int(actual_row) < remaining_seqlen;
                 [[unroll]]
-                for (int vec = 0; vec < num_vec_copies; ++vec)
+                for (uint kk = 0; kk < num_k_elements; ++kk)
                 {
-                    const uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
-                    const uint smem_idx = actual_row * kHeadDim + col;
-
-                    if (predicate_both)
+                    [[unroll]]
+                    for (uint vec = 0; vec < num_vec_copies; ++vec)
                     {
-                        const uint gmem_idx = thread_base_gmem_k + vec + m * kThreadRows * k_row_stride + kk * kBlockKGmem;
-                        smem_k[smem_idx] = buf_K.d[gmem_K_ptr + gmem_idx];
+                        uint col = thread_col * kGmemElemsPerLoad + vec + kk * kBlockKGmem;
+                        uint smem_idx = actual_row * kHeadDim + col;
+                        if (predicate_n && col < kHeadDim)
+                        {
+                            uint gmem_idx = thread_base_gmem + vec + m * kThreadRows * k_row_stride + kk * kBlockKGmem;
+                            smem_k[smem_idx] = buf_K.d[gmem_K_ptr + gmem_idx];
+                        }
                     }
                 }
             }
@@ -1263,24 +1126,15 @@ void backward_main()
     barrier();
 
     // ========================================================================
-    // Persistent accumulators for dK and dV  (N × D, fp32)
-    // Corresponds to tdKrdK / tdVrdV in CUDA; accessed as dK_acc / dV_acc
-    // in the raw path.
+    // Persistent accumulators for dK and dV — cooperative matrices (Bc × D)
     // ========================================================================
-    float dK_acc[TILE_ROWS][TILE_COLS_D];
-    float dV_acc[TILE_ROWS][TILE_COLS_D];
-    for (uint i = 0; i < TILE_ROWS; ++i)
-    {
-        for (uint j = 0; j < TILE_COLS_D; ++j)
-        {
-            dK_acc[i][j] = 0.0;
-            dV_acc[i][j] = 0.0;
-        }
-    }
-    
+    coopmat<float, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> dK_acc =
+        coopmat<float, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> dV_acc =
+        coopmat<float, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator>(0.0);
+
     // ========================================================================
-    // Compute m_block iteration range — mirrors get_m_block_min_max() in
-    // block.h.
+    // Compute m_block iteration range
     // ========================================================================
     int seqlen_q = int(params.seqlen_q);
     int seqlen_k = int(params.seqlen_k);
@@ -1289,53 +1143,53 @@ void backward_main()
 
     if (Is_local)
     {
-        m_block_max = min(m_block_max, (int(n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left + kBlockM - 1) / kBlockM);
+        m_block_max = min(m_block_max,
+            (int(n_block + 1) * kBlockN + seqlen_q - seqlen_k
+             + params.window_size_left + kBlockM - 1) / kBlockM);
     }
 
     if (Is_causal || Is_local)
     {
-        m_block_min = max(m_block_min, (int(n_block) * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
+        m_block_min = max(m_block_min,
+            (int(n_block) * kBlockN + seqlen_q - seqlen_k
+             - params.window_size_right) / kBlockM);
 
-        // It's possible to have m_block_max <= m_block_min.  Exit early.
         if (m_block_max <= m_block_min)
         {
-            uint dk_base = bidb * params.dk_batch_stride + bidh * params.dk_head_stride;
-            uint dv_base = bidb * params.dv_batch_stride + bidh * params.dv_head_stride;
-            for (uint i = 0; i < TILE_ROWS; ++i)
-            {
-                uint gRow = n_block * kBlockN + tn_d + i;
-                if (gRow < params.seqlen_k)
-                {
-                    for (uint j = 0; j < TILE_COLS_D; ++j)
-                    {
-                        uint gCol = td + j;
-                        if (gCol < kHeadDim)
-                        {
-                            buf_dK.d[dk_base + gRow * params.dk_row_stride + gCol] = float16_t(0.0);
-                            buf_dV.d[dv_base + gRow * params.dv_row_stride + gCol] = float16_t(0.0);
-                        }
-                    }
-                }
-            }
+            // Write zeros for dK and dV via coopMatStoreTensorNV
+            coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> zeros =
+                coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator>(float16_t(0.0));
+
+            tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutOut =
+                createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+            layoutOut = setTensorLayoutDimensionNV(layoutOut, params.seqlen_k, kHeadDim);
+
+            uint dk_off = bidb * params.dk_batch_stride + bidh * params.dk_head_stride;
+            tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutDK = layoutOut;
+            layoutDK = setTensorLayoutStrideNV(layoutDK, params.dk_row_stride, 1);
+            coopMatStoreTensorNV(zeros, buf_dK.d, dk_off,
+                sliceTensorLayoutNV(layoutDK, n_block * kBlockN, kBlockN, 0, kHeadDim));
+
+            uint dv_off = bidb * params.dv_batch_stride + bidh * params.dv_head_stride;
+            tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutDV = layoutOut;
+            layoutDV = setTensorLayoutStrideNV(layoutDV, params.dv_row_stride, 1);
+            coopMatStoreTensorNV(zeros, buf_dV.d, dv_off,
+                sliceTensorLayoutNV(layoutDV, n_block * kBlockN, kBlockN, 0, kHeadDim));
             return;
         }
     }
-        
+
     // ========================================================================
-    // Loop boundaries for SeparateMaskingIterations — mirrors the 3-loop
-    // structure in mainloop_bwd_sm80.hpp.
-    //
-    //   Loop 1: [m_block_min, m_block_masking_max)   — causal+local masking
-    //   Loop 2: [m_block_masking_max, m_block_max_before_local_mask) — seqlen-k mask only
-    //   Loop 3: [m_block_max_before_local_mask, m_block_max)  — local masking only
-    //
-    // When SeparateMaskingIterations == 0, loops 1 & 3 are empty and loop 2
-    // applies all masking.
+    // Loop boundaries for SeparateMaskingIterations
     // ========================================================================
-    int m_block_masking_max = min(m_block_max, ((int(n_block) + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1);
+    int m_block_masking_max = min(m_block_max,
+        ((int(n_block) + 1) * kBlockN - 1 + seqlen_q - seqlen_k
+         - params.window_size_right) / kBlockM + 1);
 
 #if IS_LOCAL
-    int m_block_max_before_local_mask = min(m_block_max, (int(n_block) * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
+    int m_block_max_before_local_mask = min(m_block_max,
+        (int(n_block) * kBlockN + seqlen_q - seqlen_k
+         + params.window_size_left) / kBlockM);
 #else
     int m_block_max_before_local_mask = m_block_max;
 #endif
@@ -1347,67 +1201,58 @@ void backward_main()
     barrier();
 
     // ========================================================================
-    // Three-loop structure mirroring mainloop_bwd_sm80.hpp.
-    //
-    // The m_block range is split so that the expensive causal/local masking
-    // checks are only applied to iterations near the mask boundaries.
-    // The middle loop runs with seqlen-k masking only (cheapest).
+    // Three-loop structure
     // ========================================================================
 
-    // Loop 1: causal + local masking (near the diagonal)
 #if IS_CAUSAL || IS_LOCAL
     for (; m_block < m_block_masking_max; ++m_block)
     {
-        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx, MASK_CAUSAL_LOCAL, m_block_max, dK_acc, dV_acc);
+        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
+                 MASK_CAUSAL_LOCAL, m_block_max, dK_acc, dV_acc);
     }
 #endif
 
-    // Loop 2: middle region — seqlen-k mask only
     for (; m_block < m_block_max_before_local_mask; ++m_block)
     {
-        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx, MASK_SEQLENK_ONLY, m_block_max, dK_acc, dV_acc);
+        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
+                 MASK_SEQLENK_ONLY, m_block_max, dK_acc, dV_acc);
     }
 
-    // Loop 3: local masking only (far side of the local window)
 #if IS_LOCAL
     for (; m_block < m_block_max; ++m_block)
     {
-        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx, MASK_LOCAL_ONLY, m_block_max, dK_acc, dV_acc);
+        bwd_step(uint(m_block), n_block, bidh, bidb, thread_idx,
+                 MASK_LOCAL_ONLY, m_block_max, dK_acc, dV_acc);
     }
 #endif
 
     // ========================================================================
-    // Epilogue: scale tdKrdK by softmax_scale, write dK and dV to global (f16)
+    // Epilogue: scale dK by softmax_scale, write dK and dV via tensor store
     // ========================================================================
-    uint dk_base = bidb * params.dk_batch_stride + bidh * params.dk_head_stride;
-    uint dv_base = bidb * params.dv_batch_stride + bidh * params.dv_head_stride;
+    dK_acc *= params.softmax_scale;
 
-    for (uint i = 0; i < TILE_ROWS; ++i)
-    {
-        uint gRow = n_block * kBlockN + tn_d + i;
-        if (gRow < params.seqlen_k)
-        {
-            for (uint j = 0; j < TILE_COLS_D; ++j)
-            {
-                uint gCol = td + j;
-                if (gCol < kHeadDim)
-                {
-                    //float16_t tmp2 = buf_dK.d[dk_base + gRow * params.dk_row_stride + gCol];
-                    //if (abs(tmp2 - float16_t(dK_acc[i][j] * params.softmax_scale)) >= 0.00001f)
-                    //{
-                    //    debugPrintfEXT("mydebug: %f %f\n", tmp2, float16_t(dK_acc[i][j] * params.softmax_scale));
-                    //}
-                    //float16_t tmp = buf_dV.d[dv_base + gRow * params.dv_row_stride + gCol];
-                    //if (abs(tmp - float16_t(dV_acc[i][j])) >= 0.00001f)
-                    //{
-                    //    debugPrintfEXT("mydebug: %f %f\n", tmp, float16_t(dV_acc[i][j]));
-                    //}
-                    buf_dK.d[dk_base + gRow * params.dk_row_stride + gCol] = float16_t(dK_acc[i][j] * params.softmax_scale);
-                    buf_dV.d[dv_base + gRow * params.dv_row_stride + gCol] = float16_t(dV_acc[i][j]);
-                }
-            }
-        }
-    }
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> dK_f16 =
+        coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator>(dK_acc);
+    coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator> dV_f16 =
+        coopmat<float16_t, gl_ScopeWorkgroup, kBlockN, kHeadDim, gl_MatrixUseAccumulator>(dV_acc);
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutDK =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutDK = setTensorLayoutDimensionNV(layoutDK, params.seqlen_k, kHeadDim);
+    layoutDK = setTensorLayoutStrideNV(layoutDK, params.dk_row_stride, 1);
+
+    uint dk_base = bidb * params.dk_batch_stride + bidh * params.dk_head_stride;
+    coopMatStoreTensorNV(dK_f16, buf_dK.d, dk_base,
+        sliceTensorLayoutNV(layoutDK, n_block * kBlockN, kBlockN, 0, kHeadDim));
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> layoutDV =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    layoutDV = setTensorLayoutDimensionNV(layoutDV, params.seqlen_k, kHeadDim);
+    layoutDV = setTensorLayoutStrideNV(layoutDV, params.dv_row_stride, 1);
+
+    uint dv_base = bidb * params.dv_batch_stride + bidh * params.dv_head_stride;
+    coopMatStoreTensorNV(dV_f16, buf_dV.d, dv_base,
+        sliceTensorLayoutNV(layoutDV, n_block * kBlockN, kBlockN, 0, kHeadDim));
 }
 
 // ============================================================================

@@ -18,7 +18,7 @@
 #include "softmax.h"
 #include "utils.h"
 
-#define FLASH_USE_CUTLASS_TENSOR 0
+#define FLASH_USE_CUTLASS_TENSOR 1
 
 namespace flash {
 

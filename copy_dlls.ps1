@@ -31,7 +31,7 @@ foreach ($buildPath in $buildPaths) {
 }
 
 # Also check for Python DLL
-$pythonDllPath = python -c "import sys; import os; print(os.path.join(sys.prefix, 'python314.dll'))"
+$pythonDllPath = py -c "import sys; import os; print(os.path.join(sys.prefix, 'python314.dll'))"
 if (Test-Path $pythonDllPath) {
     foreach ($buildPath in $buildPaths) {
         if (Test-Path "$buildPath\flash-attention.exe") {

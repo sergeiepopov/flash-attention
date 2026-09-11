@@ -21,7 +21,7 @@
 #include "rotary.h"
 #include "utils.h"
 
-#define FLASH_USE_CUTLASS_TENSOR 0
+#define FLASH_USE_CUTLASS_TENSOR 1
 #define FLASH_MANUAL_GEMM
 #define FLASH_RAW_MMA
 
@@ -1767,7 +1767,7 @@ struct CollectiveMainloopFwdSm80 {
         // So any thread gets there, all threads must have finished the previous MMA and at least started
         // writing to smem_o.
         // If persistent, need to sync to make sure all threads have finished with smem_o before writing to smem_v
-        //if constexpr (Share_QV_Smem) { __syncthreads(); }
+        if constexpr (Share_QV_Smem) { __syncthreads(); }
         //if constexpr (!PackGQA) {
 #if FLASH_USE_CUTLASS_TENSOR
             Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
@@ -1793,7 +1793,7 @@ struct CollectiveMainloopFwdSm80 {
                 tQpQ_raw[k] = thread_k_base_Q + k * kBlockKGmem < headdim_Q;
             }
 #endif
-#if 0
+#if 1
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
             // (seqlen_q - m_block * kBlockM). This is because the entries of t0QcQ are known at compile time.
             // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
@@ -2043,7 +2043,7 @@ struct CollectiveMainloopFwdSm80 {
             //if constexpr (!PagedKV) {
                 // Do we need bound check to make sure the row doesn't go above kBlockN
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
-#if 0
+#if 1
                 Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_write);
                 // We don't call flash::copy since it doesn't support bound checking
                 // to not overshot kBlockN when writing to smem.
@@ -2168,7 +2168,7 @@ struct CollectiveMainloopFwdSm80 {
 
         auto preprocess_Q = [&] {
             //if constexpr (!AppendKV) {
-                flash::cp_async_wait</*Share_QV_Smem ? 1 : */kStages * 2 - 1>();
+                flash::cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
             //} else {
             //    if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
             //        using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
@@ -2199,52 +2199,51 @@ struct CollectiveMainloopFwdSm80 {
             //    }
             //}
 
-            //if constexpr (Q_in_regs) {
-            //    __syncthreads();
-            //    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-            //    Tensor tSsQ_copy_view = smem_thr_copy_Q.partition_S(sQ);
-            //    cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
-            //}
+            if constexpr (Q_in_regs) {
+                __syncthreads();
+                Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                Tensor tSsQ_copy_view = smem_thr_copy_Q.partition_S(sQ);
+                cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
+            }
         };
 
         // If Share_QV_Smem, we load Q, then load 1 stage of K, then (optionally) rotate Q and
         // read from smem_q to registers, then load V.
         // If !Share_QV, Smem, we load Q, load all stages of K & V, then (optionally) rotate Q.
 
-        //if constexpr (Share_QV_Smem) {
-        //    load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
-        //    cute::cp_async_fence();
-        //    preprocess_Q();
-        //    __syncthreads();  // Make sure all threads have read smem_q before loading V
-        //}
+        if constexpr (Share_QV_Smem) {
+            load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+            cute::cp_async_fence();
+            preprocess_Q();
+            __syncthreads();  // Make sure all threads have read smem_q before loading V
+        }
 
         // For persistent, make sure all threads have finished reading smem_o
-        //if constexpr (!Share_QV_Smem)
-        //{
+        if constexpr (!Share_QV_Smem)
+        {
             __syncthreads();
-        //}
+        }
         // Note, using the for_each() function here to ensure `stage` is of type Int<x>.
-        //for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
-            Int<0> stage;
-            static constexpr bool Is_first_stage = /*CUTE_STATIC_V(stage) == 0*/true;
-            //static constexpr bool Is_last_stage = /*CUTE_STATIC_V(stage) == kStages - 1*/true;
-            //if constexpr (!Share_QV_Smem || !Is_first_stage) {
-                //if (Is_first_stage || n_block - stage >= n_block_min) {
+        for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
+            static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
+            static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
+            if constexpr (!Share_QV_Smem || !Is_first_stage) {
+                if (Is_first_stage || n_block - stage >= n_block_min) {
                     load_K(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
-                //}
+                }
                 // We want the fence outside the if statement to have a fixed number of cp.async commits.
                 // so that we can wait with the correct number of outstanding commits.
                 cute::cp_async_fence();
-            //}
-            //if constexpr (!Is_last_stage) {
-            //    if (Is_first_stage || n_block - stage >= n_block_min) {
-            //        load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
-            //    }
-            //    cute::cp_async_fence();
-            //}
-        //});
+            }
+            if constexpr (!Is_last_stage) {
+                if (Is_first_stage || n_block - stage >= n_block_min) {
+                    load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                }
+                cute::cp_async_fence();
+            }
+        });
 
-        //if constexpr (!Share_QV_Smem) 
+        if constexpr (!Share_QV_Smem) 
         {
             preprocess_Q();
         }
@@ -2370,7 +2369,7 @@ struct CollectiveMainloopFwdSm80 {
 #endif
 
 
-#if 0
+#if 1
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
@@ -2669,11 +2668,11 @@ struct CollectiveMainloopFwdSm80 {
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             //scoremod_premask_fn(tSrS);
             // Faster to load_K before gemm if we only have 1 stage
-            //if constexpr (kStages == 1)
-            //{
+            if constexpr (kStages == 1)
+            {
                 sync();
                 load_K_next();
-            //}
+            }
             // K-blocks for P×V GEMM = kBlockN / MMA_atom_K.
             // Equals size<2>(tOrP) in CuTe path; defined here in common code for both paths.
             static constexpr int KBlocksPV = kBlockN / (UseSM80MMA ? 16 : 8);
@@ -2760,10 +2759,10 @@ struct CollectiveMainloopFwdSm80 {
                 flash::rescale_o_raw_regs<NAtomsM_O, NAtomsN_O>(O_regs, scores_scale_raw);
 #endif
             }
-            //if constexpr (kStages > 1)
-            //{
-            //    sync();
-            //}
+            if constexpr (kStages > 1)
+            {
+                sync();
+            }
 #if FLASH_USE_CUTLASS_TENSOR
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
 #else
@@ -2780,7 +2779,7 @@ struct CollectiveMainloopFwdSm80 {
             static constexpr int RegsPerKBlockV = NAtomsV * VRegsPerAtomV;
             uint32_t V_regs[KBlocksV * RegsPerKBlockV];
 #endif
-#if 0
+#if 1
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, /*kStages > 1 ? smem_pipe_read : */0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 #else
             // ============================================================================
@@ -2964,10 +2963,10 @@ struct CollectiveMainloopFwdSm80 {
             //   - Loop continues to next KV block until all blocks processed
             // ============================================================================
 #endif
-            //if constexpr (kStages > 1)
-            //{
-            //    load_K_next();
-            //}
+            if constexpr (kStages > 1)
+            {
+                load_K_next();
+            }
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };
 
